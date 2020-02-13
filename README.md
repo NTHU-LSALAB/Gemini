@@ -55,9 +55,7 @@ For more details, refer to those scripts and source code.
 
 ## Contributors
 
-<img src="https://avatars.githubusercontent.com/jim90247" width="30" />[jim90247](https://github.com/jim90247)
-
-<img src="https://avatars.githubusercontent.com/eee4017" width="30" />[eee4017](https://github.com/eee4017)
-
-<img src="https://avatars.githubusercontent.com/ncy9371" width="30" />[ncy9371](https://github.com/ncy9371)
+[jim90247](https://github.com/jim90247)
+[eee4017](https://github.com/eee4017)
+[ncy9371](https://github.com/ncy9371)
 
