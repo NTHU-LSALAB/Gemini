@@ -19,7 +19,6 @@
 
 #include <pthread.h>
 
-#include <algorithm>
 #include <chrono>
 #include <deque>
 
@@ -45,8 +44,10 @@ class Predictor {
   pthread_mutex_t mutex_;
   timepoint_t period_begin_;
   timepoint_t last_period_begin_, last_period_end_;
-  std::deque<double> past_records_;
-  double max_duration_;
+  std::deque<std::pair<unsigned long, double>> past_records_;  // a decreasing list of durations
+  unsigned long counter_; // record counter, assume total records won't exceed 2^64-1
+
+  void add_record(double);
 };
 
 #endif

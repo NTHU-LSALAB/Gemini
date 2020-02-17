@@ -24,6 +24,7 @@
 
 #include "debug.h"
 
+using std::make_pair;
 using std::chrono::duration_cast;
 using std::chrono::microseconds;
 using std::chrono::steady_clock;
@@ -33,11 +34,19 @@ Predictor::Predictor(const char *name, const double thres) : MERGE_THRES(thres) 
   period_begin_ = timepoint_t::max();
   last_period_begin_ = timepoint_t::max();
   last_period_end_ = timepoint_t::min();
-  max_duration_ = 0.0;
+  counter_ = 0;
   this->name = name;
 }
 
 Predictor::~Predictor() { pthread_mutex_destroy(&mutex_); }
+
+// maintains the decreasing property, for O(1) time complexity
+void Predictor::add_record(double duration) {
+  // maintain a decreasing list
+  while (!past_records_.empty() && past_records_.back().second < duration) past_records_.pop_back();
+  past_records_.push_back(make_pair(counter_, duration));
+  ++counter_;
+}
 
 // Marks complete for a period
 void Predictor::record_stop() {
@@ -50,8 +59,7 @@ void Predictor::record_stop() {
     // record kernel burst duration
     tp = steady_clock::now();
     duration = duration_cast<microseconds>(tp - period_begin_).count() / 1e3;
-    past_records_.push_back(duration);
-    max_duration_ = std::max(duration, max_duration_);  // update max_duration
+    add_record(duration);
     last_period_end_ = tp;
     DEBUG("%s: record stop (length: %.3f ms)", name, duration);
   }
@@ -95,8 +103,10 @@ void Predictor::interrupt() {
 
 double Predictor::predict() {
 #ifndef NO_PREDICT
+  double ret = 0;
   pthread_mutex_lock(&mutex_);
-  double ret = max_duration_;
+  // first one is the maximum
+  if (!past_records_.empty()) ret = past_records_.front().second;
   pthread_mutex_unlock(&mutex_);
   return ret;
 #else
@@ -104,17 +114,13 @@ double Predictor::predict() {
 #endif
 }
 
-// Trim past records and re-calculate max_duration
+// Trim past records
 void Predictor::recalc() {
 #ifndef NO_PREDICT
   pthread_mutex_lock(&mutex_);
-  // let time complexity be amortized O(1)
-  if (past_records_.size() > PREDICT_MAX_KEEP) {
-    while (past_records_.size() > PREDICT_MAX_KEEP / 2) past_records_.pop_front();
-    max_duration_ = 0.0;
-    for (auto x : past_records_) max_duration_ = std::max(max_duration_, x);
-    DEBUG("%s: recalc = %.3f", name, max_duration_);
-  }
+  while (!past_records_.empty() && counter_ - past_records_.front().first > PREDICT_MAX_KEEP)
+    past_records_.pop_front();
+  DEBUG("%s: recalc = %.3f", name, past_records_.front().second);
   pthread_mutex_unlock(&mutex_);
 #endif
 }
@@ -127,7 +133,7 @@ void Predictor::reset() {
   period_begin_ = timepoint_t::max();
   last_period_begin_ = timepoint_t::max();
   last_period_end_ = timepoint_t::min();
-  max_duration_ = 0.0;
+  counter_ = 0;
   pthread_mutex_unlock(&mutex_);
 #endif
 }
