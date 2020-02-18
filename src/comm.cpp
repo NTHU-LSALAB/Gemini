@@ -15,11 +15,13 @@
  */
 
 /**
- * Unified communication interface.
+ * Unified communication interface and network-related helper functions.
  * This should be the only place for message/request creation.
  */
 
 #include "comm.h"
+
+#include "debug.h"
 
 reqid_t prepare_request(char *buf, comm_request_t type, ...) {
   static char *client_name = nullptr;
@@ -116,4 +118,18 @@ char *parse_response(char *buf, reqid_t *id) {
   if (id != nullptr) *id = id_;
 
   return buf + pos;
+}
+
+// Attempt a function several times. Non-zero return of func is treated as an error. If func return
+// -1, errno will be returned.
+int multiple_attempt(std::function<int()> func, int max_attempt, int interval) {
+  int rc;
+  for (int attempt = 1; attempt <= max_attempt; attempt++) {
+    rc = func();
+    if (rc == 0) break;
+    if (rc == -1) rc = errno;
+    ERROR("attempt %d: %s", attempt, strerror(rc));
+    if (interval > 0) sleep(interval);
+  }
+  return rc;
 }

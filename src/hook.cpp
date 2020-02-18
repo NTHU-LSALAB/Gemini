@@ -148,6 +148,8 @@ void *dlsym(void *handle, const char *symbol) {
 char pod_manager_ip[20] = "127.0.0.1";
 uint16_t pod_manager_port = 50052;                       // default value
 pthread_mutex_t comm_mutex = PTHREAD_MUTEX_INITIALIZER;  // one communication at a time
+const int NET_OP_MAX_ATTEMPT = 5;  // maximum time retrying failed network operations
+const int NET_OP_RETRY_INTV = 10;  // seconds between two retries
 
 /* GPU computation resource usage */
 double quota_time = 0;  // time quota from scheduler
@@ -219,10 +221,12 @@ int establish_connection() {
   info.sin_addr.s_addr = inet_addr(pod_manager_ip);
   info.sin_port = htons(pod_manager_port);
 
-  int err = connect(sockfd, (struct sockaddr *)&info, sizeof(info));
-  if (err == -1) {
-    ERROR("Connection error: %s", strerror(errno));
-    exit(-1);
+  int rc = multiple_attempt(
+      [&]() -> int { return connect(sockfd, (struct sockaddr *)&info, sizeof(info)); },
+      NET_OP_MAX_ATTEMPT, NET_OP_RETRY_INTV);
+  if (rc != 0) {
+    ERROR("Connection error: %s", strerror(rc));
+    exit(rc);
   }
 
   return sockfd;
@@ -232,25 +236,33 @@ int establish_connection() {
  * Unified communication method with Pod manager/scheduler.
  * Send a request and receive a response.
  * Only one thread can communicate at the same time.
- * @param sbuf buffer with the data to send. Max size is 80 bytes
+ * @param sbuf buffer with the data to send.
+ * @param rbug buffer which will be filled with received data.
+ * @param socket_timeout socket timeout (second), 0 means never timeout
  * @return buffer with received data
  */
-char *communicate(char *sbuf) {
-  pthread_mutex_lock(&comm_mutex);
+int communicate(char *sbuf, char *rbuf, int socket_timeout) {
   static int sockfd = establish_connection();
-  if (send(sockfd, sbuf, REQ_MSG_LEN, 0) == -1) {
-    ERROR("Failed to send message to Pod manager!");
-    pthread_mutex_unlock(&comm_mutex);
-    exit(-1);
-  }
-  char *rbuf = new char[RSP_MSG_LEN];
-  if (recv(sockfd, rbuf, RSP_MSG_LEN, 0) <= 0) {
-    ERROR("Failed to receive message from Pod manager!");
-    pthread_mutex_unlock(&comm_mutex);
-    exit(-1);
-  }
+  int rc;
+  struct timeval tv;
+
+  pthread_mutex_lock(&comm_mutex);
+
+  // set socket timeout
+  tv = {socket_timeout, 0};
+  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  // perform communication
+  rc = multiple_attempt(
+      [&]() -> int {
+        if (send(sockfd, sbuf, REQ_MSG_LEN, 0) == -1) return -1;
+        if (recv(sockfd, rbuf, RSP_MSG_LEN, 0) == -1) return -1;
+        return 0;
+      },
+      NET_OP_MAX_ATTEMPT);
+
   pthread_mutex_unlock(&comm_mutex);
-  return rbuf;
+  return rc;
 }
 
 /**
@@ -259,20 +271,24 @@ char *communicate(char *sbuf) {
  * @return remaining memory, memory limit
  */
 std::pair<size_t, size_t> get_gpu_memory_info() {
-  char sbuf[REQ_MSG_LEN], *rbuf, *attached;
+  char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   size_t rpos = 0;
+  int rc;
   size_t used, total;
 
   bzero(sbuf, REQ_MSG_LEN);
   prepare_request(sbuf, REQ_MEM_LIMIT);
 
   // get data from Pod manager
-  rbuf = communicate(sbuf);
+  rc = communicate(sbuf, rbuf, NET_OP_RETRY_INTV);
+  if (rc != 0) {
+    ERROR("failed to get GPU memory information: %s", strerror(rc));
+    exit(rc);
+  }
   attached = parse_response(rbuf, nullptr);
   used = get_msg_data<size_t>(attached, rpos);
   total = get_msg_data<size_t>(attached, rpos);
 
-  delete[] rbuf;
   return std::make_pair(total - used, total);
 }
 
@@ -283,19 +299,23 @@ std::pair<size_t, size_t> get_gpu_memory_info() {
  * @return request succeed or not
  */
 int update_memory_usage(size_t bytes, int is_allocate) {
-  char sbuf[REQ_MSG_LEN], *rbuf, *attached;
+  char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   size_t rpos = 0;
+  int rc;
   int verdict;
 
   bzero(sbuf, REQ_MSG_LEN);
   prepare_request(sbuf, REQ_MEM_UPDATE, bytes, is_allocate);
 
   // get verdict from Pod manager
-  rbuf = communicate(sbuf);
+  rc = communicate(sbuf, rbuf, NET_OP_RETRY_INTV);
+  if (rc != 0) {
+    ERROR("failed to update GPU memory usage: %s", strerror(rc));
+    exit(rc);
+  }
   attached = parse_response(rbuf, nullptr);
   verdict = get_msg_data<int>(attached, rpos);
 
-  delete[] rbuf;
   return verdict;
 }
 
@@ -304,20 +324,24 @@ int update_memory_usage(size_t bytes, int is_allocate) {
  * @return received time quota (milliseconds)
  */
 double get_token_from_scheduler() {
-  char sbuf[REQ_MSG_LEN], *rbuf, *attached;
+  char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   size_t rpos = 0;
+  int rc;
   double new_quota;
 
   bzero(sbuf, REQ_MSG_LEN);
   prepare_request(sbuf, REQ_QUOTA, overuse, burst_predictor.predict(), window_predictor.predict());
 
-  // retrieve quota from scheduler
-  rbuf = communicate(sbuf);
+  // retrieve token from scheduler
+  rc = communicate(sbuf, rbuf, 0);
+  if (rc != 0) {
+    ERROR("failed to get token from scheduler: %s", strerror(rc));
+    exit(rc);
+  }
   attached = parse_response(rbuf, nullptr);
   new_quota = get_msg_data<double>(attached, rpos);
 
   DEBUG("Get token from scheduler, quota: %f", new_quota);
-  delete[] rbuf;
   return new_quota;
 }
 

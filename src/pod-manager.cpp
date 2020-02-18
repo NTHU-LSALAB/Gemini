@@ -31,11 +31,13 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <queue>
 
@@ -75,6 +77,10 @@ uint32_t req_cnt = 0;
 pthread_mutex_t req_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t req_queue_cond = PTHREAD_COND_INITIALIZER;
 
+std::map<reqid_t, request> pending_request_map;
+pthread_mutex_t pending_req_mutex = PTHREAD_MUTEX_INITIALIZER;
+// pthread_cond_t pending_req_cond = PTHREAD_COND_INITIALIZER;
+
 struct response {
   void *data;
 };
@@ -103,7 +109,47 @@ pthread_cond_t quota_state_cond = PTHREAD_COND_INITIALIZER;
 size_t pod_name_len;
 char pod_name[HOST_NAME_MAX];
 
+// retrieve memory limit information from scheduler
+int retrieve_mem_info(int sockfd, const int MAX_RETRY, const long RETRY_TIMEOUT) {
+  // retry settings when failed to reach scheduler
+  int rc;
+  char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
+  size_t pos = 0;
+
+  // set socket timeout option
+  struct timeval tv = {RETRY_TIMEOUT, 0};
+  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  bzero(sbuf, REQ_MSG_LEN);
+  prepare_request(sbuf, REQ_MEM_LIMIT);
+
+  rc = multiple_attempt(
+      [&]() -> int {
+        if (send(sockfd, &sbuf, REQ_MSG_LEN, 0) == -1) return -1;
+        if (recv(sockfd, rbuf, RSP_MSG_LEN, 0) == -1) return -1;
+        return 0;
+      },
+      MAX_RETRY, 0);
+  if (rc != 0) return rc;
+
+  // disable timeout option
+  tv.tv_sec = 0;
+  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  // parse received data and get memory limit
+  attached = parse_response(rbuf, nullptr);
+  gpu_mem_used = get_msg_data<size_t>(attached, pos);  // should be 0
+  gpu_mem_limit = get_msg_data<size_t>(attached, pos);
+  assert(gpu_mem_used == (size_t)0);
+  INFO("GPU memory limit: %lu bytes.", gpu_mem_limit);
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
+  const int NET_OP_MAX_ATTEMPT = 5;  // maximum time retrying failed network operations
+  const int NET_OP_RETRY_INTV = 10;  // seconds between two retries
+  int rc;
+
   // for debugging
   signal(SIGSEGV, sig_handler);
 
@@ -139,8 +185,8 @@ int main(int argc, char *argv[]) {
   // create socket
   int schd_sockfd = socket(PF_INET, SOCK_STREAM, 0);
   if (schd_sockfd == -1) {
-    ERROR("schd_sockfd == -1");
-    exit(-1);
+    ERROR("failed to create socket: %s", strerror(errno));
+    exit(errno);
   }
 
   // setup socket info
@@ -151,46 +197,19 @@ int main(int argc, char *argv[]) {
   schd_info.sin_port = htons(SCHEDULER_PORT);
 
   // connect to scheduler
-  int schd_conn_err = connect(schd_sockfd, (struct sockaddr *)&schd_info, sizeof(schd_info));
-  if (schd_conn_err == -1) {
-    ERROR("schd_conn_err == -1");
-    exit(-1);
-  }
+  rc = multiple_attempt(
+      [&]() -> int {
+        return connect(schd_sockfd, (struct sockaddr *)&schd_info, sizeof(schd_info));
+      },
+      NET_OP_MAX_ATTEMPT, NET_OP_RETRY_INTV);
+  if (rc != 0) exit(rc);
 
   /* get memory limit for this pod */
-  // build request
-  char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
-  size_t pos = 0;
-  bzero(sbuf, REQ_MSG_LEN);
-  prepare_request(sbuf, REQ_MEM_LIMIT);
-
-  // communicate with scheduler
-  if (send(schd_sockfd, &sbuf, REQ_MSG_LEN, 0) == -1) {
-    ERROR("failed to send memory limit request to scheduler!");
-    exit(-1);
-  }
-  if (recv(schd_sockfd, rbuf, RSP_MSG_LEN, 0) == -1) {
-    ERROR("failed to receive memory limit from scheduler!");
-    exit(-1);
-  }
-
-  // parse received data and get memory limit
-  pos = 0;
-  attached = parse_response(rbuf, nullptr);
-  gpu_mem_used = get_msg_data<size_t>(attached, pos);  // should be 0
-  gpu_mem_limit = get_msg_data<size_t>(attached, pos);
-  assert(gpu_mem_used == (size_t)0);
-  INFO("GPU memory limit for this Pod: %lu bytes.", gpu_mem_limit);
+  rc = retrieve_mem_info(schd_sockfd, NET_OP_MAX_ATTEMPT, NET_OP_RETRY_INTV);
+  if (rc != 0) exit(rc);
 
   // initialize quota receiving time
   quota_updated_tp = steady_clock::now();
-
-  // start scheduler threads
-  pthread_t schd_send_tid, schd_recv_tid;
-  pthread_create(&schd_send_tid, NULL, scheduler_thread_send_func, &schd_sockfd);
-  pthread_create(&schd_recv_tid, NULL, scheduler_thread_recv_func, &schd_sockfd);
-  pthread_detach(schd_send_tid);
-  pthread_detach(schd_recv_tid);
 
   /* accept connections from hook libraries */
   // create accept socket
@@ -207,8 +226,20 @@ int main(int argc, char *argv[]) {
   server_info.sin_addr.s_addr = INADDR_ANY;
   server_info.sin_port = htons(POD_SERVER_PORT);
 
-  bind(accept_sockfd, (struct sockaddr *)&server_info, sizeof(server_info));
+  rc = multiple_attempt(
+      [&]() -> int {
+        return bind(accept_sockfd, (struct sockaddr *)&server_info, sizeof(server_info));
+      },
+      NET_OP_MAX_ATTEMPT, NET_OP_RETRY_INTV);
+  if (rc != 0) exit(rc);
   listen(accept_sockfd, SOMAXCONN);
+
+  // start scheduler threads
+  pthread_t schd_send_tid, schd_recv_tid;
+  pthread_create(&schd_send_tid, NULL, scheduler_thread_send_func, &schd_sockfd);
+  pthread_create(&schd_recv_tid, NULL, scheduler_thread_recv_func, &schd_sockfd);
+  pthread_detach(schd_send_tid);
+  pthread_detach(schd_recv_tid);
 
   int client_sockfd = 0;
   struct sockaddr_in client_info;

@@ -23,6 +23,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 
 typedef int32_t reqid_t;
 enum comm_request_t { REQ_QUOTA, REQ_MEM_LIMIT, REQ_MEM_UPDATE };
@@ -52,5 +53,8 @@ size_t append_msg_data(char *buf, size_t &pos, T data) {
   memcpy(buf + pos, &data, sizeof(T));
   return (pos = pos + sizeof(T));
 }
+
+// Attempt a function several times. Non-zero return of func is treated as an error
+int multiple_attempt(std::function<int()> func, int max_attempt, int interval = 0);
 
 #endif
