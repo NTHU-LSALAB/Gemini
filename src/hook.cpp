@@ -321,16 +321,18 @@ int update_memory_usage(size_t bytes, int is_allocate) {
 
 /**
  * send token request to scheduling system
+ * @param pred_burst predicted kernel burst (milliseconds)
+ * @param pred_window predicted window period (milliseconds)
  * @return received time quota (milliseconds)
  */
-double get_token_from_scheduler() {
+double get_token_from_scheduler(double pred_burst, double pred_window) {
   char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   size_t rpos = 0;
   int rc;
   double new_quota;
 
   bzero(sbuf, REQ_MSG_LEN);
-  prepare_request(sbuf, REQ_QUOTA, overuse, burst_predictor.predict(), window_predictor.predict());
+  prepare_request(sbuf, REQ_QUOTA, overuse, pred_burst, pred_window);
 
   // retrieve token from scheduler
   rc = communicate(sbuf, rbuf, 0);
@@ -362,15 +364,15 @@ void *wait_cuda_kernels(void *args) {
     pthread_cond_wait(&overuse_trk_strt_cond, &overuse_trk_mutex);
     pthread_mutex_unlock(&overuse_trk_mutex);
 
-    // calculate time to wake
-    nsec = std::max(quota_time - burst_predictor.predict(), 0.0) * 1e6;
+    // calculate token expiration time
+    nsec = std::max(quota_time, 0.0) * 1e6;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_sec += floor(nsec / 1e9);
     ts.tv_nsec += (nsec - floor(nsec / 1e9) * 1e9);
     ts.tv_sec += ts.tv_nsec / 1000000000;
     ts.tv_nsec %= 1000000000;
 
-    // sleep until going to overuse or being notified
+    // sleep until token expired or being notified
     pthread_mutex_lock(&overuse_trk_mutex);
     int rc = pthread_cond_timedwait(&overuse_trk_intr_cond, &overuse_trk_mutex, &ts);
     if (rc != ETIMEDOUT) DEBUG("overuse tracking thread interrupted");
@@ -420,40 +422,39 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
                                 unsigned int blockDimY, unsigned int blockDimZ,
                                 unsigned int sharedMemBytes, CUstream hStream, void **kernelParams,
                                 void **extra) {
-  double new_quota;
+  double new_quota, pred_burst, pred_window;
 
   window_predictor.record_stop();
 
   // check if token expired
   pthread_mutex_lock(&expiration_status_mutex);
-  if (us_since(request_start) / 1000.0 + burst_predictor.predict() >= quota_time) {
-    DEBUG("burst: %.3f ms, window: %.3f ms", burst_predictor.predict(), window_predictor.predict());
+  // ISSUE: if kernel burst > quota, client will ask for quota every time it launches a kernel
+  // consider limit the size of a kernel burst
+  if (us_since(request_start) / 1e3 + burst_predictor.predict_remain() >= quota_time) {
+    pred_burst = burst_predictor.predict_ctxfree();
+    pred_window = window_predictor.predict_ctxfree();
+    DEBUG("burst: %.3f ms, window: %.3f ms", pred_burst, pred_window);
     // wait for all kernels finish
     pthread_mutex_lock(&overuse_trk_mutex);
     if (!overuse_trk_cmpl) {
-      // notify overuse tracking thread to perform sync, because the burst duration predicted here
-      // might be greater than the one predicted at the time tracking thread determine how long to
-      // sleep
+      // notify overuse tracking thread to perform sync eariler
       pthread_cond_signal(&overuse_trk_intr_cond);
       pthread_cond_wait(&overuse_trk_cmpl_cond, &overuse_trk_mutex);
     }
     pthread_mutex_unlock(&overuse_trk_mutex);
 
-    new_quota = get_token_from_scheduler();
+    window_predictor.interrupt();
+
+    new_quota = get_token_from_scheduler(pred_burst, pred_window);
+
+    // ensure predicted kernel burst is always less than quota
+    burst_predictor.set_upperbound(new_quota - 1.0);
 
     cudaEventRecord(cuevent_start, 0);
     clock_gettime(CLOCK_MONOTONIC, &request_start);  // time
 
-    // resize of past kernel burst record is only allowed here, since we must guarantee that the
-    // predicted duration in this prehook will never be less than the one predicted in overuse
-    // tracking thread (so the interrupt() call in wait_cuda_kernel can cover all cases)
-    burst_predictor.recalc();
-
     // if quota changed, window period may also change
-    if (abs(new_quota - quota_time) > 1e-3)
-      window_predictor.reset();
-    else
-      window_predictor.recalc();
+    if (abs(new_quota - quota_time) > 1e-3) window_predictor.reset();
 
     quota_time = new_quota;
 
@@ -646,7 +647,7 @@ void initialize() {
 
   // first token request
   overuse_trk_cmpl = true;  // bypass first overuse tracking to prevent deadlock
-  get_token_from_scheduler();
+  get_token_from_scheduler(0, 0);
 
   pthread_mutex_unlock(&request_time_mutex);
 }

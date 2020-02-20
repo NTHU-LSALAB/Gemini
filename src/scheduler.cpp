@@ -158,25 +158,27 @@ double ClientInfo::get_max_fraction() { return MAX_FRAC; }
 
 // self-adaptive quota algorithm
 double ClientInfo::get_quota() {
-  double best_fit;
-  if (latest_burst_ < 1e-9 || latest_actual_usage_ / latest_burst_ <= 1.0) {
-    // first condition avoid floating point error when divisor is too small or 0
-    quota_ = latest_burst_ + EXTRA_QUOTA;
+  const double UPDATE_RATE = 0.5;  // how drastically will the quota changes
+  double best_fit, new_quota;
+
+  if (latest_burst_ < 1e-9) {
+    // special case when no burst data available
+    quota_ = latest_actual_usage_;
   } else {
-    if (latest_window_ >= SCHD_OVERHEAD) {
-      quota_ = latest_actual_usage_ - latest_window_;
-    } else {
-      best_fit = floor(BASE_QUOTA / latest_burst_) * latest_burst_;
-      if (best_fit - latest_actual_usage_ > latest_burst_) {
-        quota_ = latest_actual_usage_ + latest_burst_;
-      }
-    }
+    // best_fit = ceil(BASE_QUOTA / latest_burst_) * latest_burst_;
+    new_quota = latest_burst_;
+    // if latest window is small, client must be in active usage
+    if (latest_window_ <= SCHD_OVERHEAD) new_quota *= 2;  // boost the quota
+
+    quota_ = new_quota * UPDATE_RATE + quota_ * (1 - UPDATE_RATE);
   }
-  quota_ = std::min(quota_, MAX_QUOTA);                                 // upperbound
+
   quota_ = std::max({quota_, MIN_QUOTA, latest_burst_ + EXTRA_QUOTA});  // lowerbound
-  DEBUG("AccountInfo %s: usage = %.3f ms burst = %.3f ms, window = %.3f ms", name.c_str(),
-        latest_actual_usage_, latest_burst_, latest_window_);
-  return this->quota_;
+  quota_ = std::min(quota_, MAX_QUOTA);                                 // upperbound
+
+  DEBUG("%s: latest usage = %.3f ms, burst = %.3f ms, window = %.3f ms, give quota = %.3f ms",
+        name.c_str(), latest_actual_usage_, latest_burst_, latest_window_, quota_);
+  return quota_;
 }
 
 // map container name to object

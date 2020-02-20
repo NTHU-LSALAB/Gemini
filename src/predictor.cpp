@@ -24,6 +24,7 @@
 
 #include "debug.h"
 
+using std::make_pair;
 using std::chrono::duration_cast;
 using std::chrono::microseconds;
 using std::chrono::steady_clock;
@@ -33,11 +34,23 @@ Predictor::Predictor(const char *name, const double thres) : MERGE_THRES(thres) 
   period_begin_ = timepoint_t::max();
   last_period_begin_ = timepoint_t::max();
   last_period_end_ = timepoint_t::min();
-  max_duration_ = 0.0;
-  this->name = name;
+  upperbound_ = std::numeric_limits<double>::max();
+  counter_ = 0;
+  name_ = name;
 }
 
 Predictor::~Predictor() { pthread_mutex_destroy(&mutex_); }
+
+// maintains the decreasing property, for O(1) time complexity
+void Predictor::add_record(double duration) {
+  // remove outdated records
+  while (!past_records_.empty() && counter_ - past_records_.front().first > PREDICT_MAX_KEEP)
+    past_records_.pop_front();
+  // maintain a decreasing list
+  while (!past_records_.empty() && past_records_.back().second < duration) past_records_.pop_back();
+  past_records_.push_back(make_pair(counter_, duration));
+  ++counter_;
+}
 
 // Marks complete for a period
 void Predictor::record_stop() {
@@ -47,13 +60,12 @@ void Predictor::record_stop() {
 
   pthread_mutex_lock(&mutex_);
   if (period_begin_ != timepoint_t::max()) {
-    // record kernel burst duration
+    // record duration
     tp = steady_clock::now();
     duration = duration_cast<microseconds>(tp - period_begin_).count() / 1e3;
-    past_records_.push_back(duration);
-    max_duration_ = std::max(duration, max_duration_);  // update max_duration
+    add_record(duration);
     last_period_end_ = tp;
-    DEBUG("%s: record stop (length: %.3f ms)", name, duration);
+    DEBUG("%s: record stop (length: %.3f ms)", name_, duration);
   }
   period_begin_ = timepoint_t::max();
   pthread_mutex_unlock(&mutex_);
@@ -69,12 +81,13 @@ void Predictor::record_start() {
     period_begin_ = steady_clock::now();
     period_intv = duration_cast<microseconds>(period_begin_ - last_period_end_).count() / 1e3;
     if (last_period_end_ != timepoint_t::min() && period_intv < MERGE_THRES) {
-      DEBUG("%s: merge", name);
+      DEBUG("%s: merge", name_);
       period_begin_ = last_period_begin_;
+      --counter_;
     }
 
     last_period_begin_ = period_begin_;
-    DEBUG("%s: record start", name);
+    DEBUG("%s: record start", name_);
   }
   pthread_mutex_unlock(&mutex_);
 #endif
@@ -88,33 +101,54 @@ void Predictor::interrupt() {
   period_begin_ = timepoint_t::max();
   last_period_begin_ = timepoint_t::max();
   last_period_end_ = timepoint_t::min();
-  DEBUG("%s: interrupted", name);
+  DEBUG("%s: interrupted", name_);
   pthread_mutex_unlock(&mutex_);
 #endif
 }
 
-double Predictor::predict() {
-#ifndef NO_PREDICT
-  pthread_mutex_lock(&mutex_);
-  double ret = max_duration_;
-  pthread_mutex_unlock(&mutex_);
-  return ret;
-#else
-  return 0;
-#endif
-}
+// Get remaining time of current period. Same as predict_ctxfree when not in a period.
+double Predictor::predict_remain() {
+  double intv, time_remain = 0;
+  timepoint_t now;
 
-// Trim past records and re-calculate max_duration
-void Predictor::recalc() {
 #ifndef NO_PREDICT
   pthread_mutex_lock(&mutex_);
-  // let time complexity be amortized O(1)
-  if (past_records_.size() > PREDICT_MAX_KEEP) {
-    while (past_records_.size() > PREDICT_MAX_KEEP / 2) past_records_.pop_front();
-    max_duration_ = 0.0;
-    for (auto x : past_records_) max_duration_ = std::max(max_duration_, x);
-    DEBUG("%s: recalc = %.3f", name, max_duration_);
+
+  now = steady_clock::now();
+  intv = duration_cast<microseconds>(now - last_period_end_).count() / 1e3;
+
+  if (!past_records_.empty()) {
+    // enforce an upperbound
+    time_remain = std::min(past_records_.front().second, upperbound_);
+    // if in a mini-period (mini-burst) || a merge event should occur
+    if (period_begin_ != timepoint_t::max() ||
+        (last_period_end_ != timepoint_t::min() && intv < MERGE_THRES))
+      time_remain -= duration_cast<microseconds>(now - last_period_begin_).count() / 1e3;
+    // remaining time should never be negative
+    if (time_remain < 0.0) time_remain = 0.0;
+    DEBUG("%s: period remain = %.3f", name_, time_remain);
   }
+  pthread_mutex_unlock(&mutex_);
+#endif
+  return time_remain;
+}
+
+// Get the duration of a full period. Mini-period == Full period when no merge occurs.
+double Predictor::predict_ctxfree() {
+  double pred = 0.0;
+
+#ifndef NO_PREDICT
+  pthread_mutex_lock(&mutex_);
+  if (!past_records_.empty()) pred = past_records_.front().second;
+  pthread_mutex_unlock(&mutex_);
+#endif
+  return pred;
+}
+
+void Predictor::set_upperbound(const double bound) {
+#ifndef NO_PREDICT
+  pthread_mutex_lock(&mutex_);
+  upperbound_ = bound;
   pthread_mutex_unlock(&mutex_);
 #endif
 }
@@ -127,7 +161,7 @@ void Predictor::reset() {
   period_begin_ = timepoint_t::max();
   last_period_begin_ = timepoint_t::max();
   last_period_end_ = timepoint_t::min();
-  max_duration_ = 0.0;
+  counter_ = 0;
   pthread_mutex_unlock(&mutex_);
 #endif
 }
