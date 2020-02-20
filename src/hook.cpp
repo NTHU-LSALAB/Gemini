@@ -423,6 +423,9 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
 
     new_quota = get_token_from_scheduler(pred_burst, pred_window);
 
+    // ensure predicted kernel burst is always less than quota
+    burst_predictor.set_upperbound(new_quota - 1.0);
+
     cudaEventRecord(cuevent_start, 0);
     clock_gettime(CLOCK_MONOTONIC, &request_start);  // time
 

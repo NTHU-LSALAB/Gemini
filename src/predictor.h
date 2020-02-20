@@ -35,16 +35,18 @@ class Predictor {
   void interrupt();
   double predict_remain();
   double predict_ctxfree();
+  void set_upperbound(const double bound);
   void reset();
 
  private:
-  const char *name;
+  const char *name_;
   // two consecutive period with interval less than this value will be merged
   const double MERGE_THRES;
   pthread_mutex_t mutex_;
   timepoint_t period_begin_;
   timepoint_t last_period_begin_, last_period_end_;
   std::deque<std::pair<unsigned long, double>> past_records_;  // a decreasing list of durations
+  double upperbound_;
   unsigned long counter_;  // record counter, assume total records won't exceed 2^64-1
 
   void add_record(double);
