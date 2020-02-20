@@ -33,8 +33,8 @@ class Predictor {
   void record_stop();
   void record_start();
   void interrupt();
-  double predict();
-  void recalc();
+  double predict_remain();
+  double predict_ctxfree();
   void reset();
 
  private:
@@ -45,7 +45,7 @@ class Predictor {
   timepoint_t period_begin_;
   timepoint_t last_period_begin_, last_period_end_;
   std::deque<std::pair<unsigned long, double>> past_records_;  // a decreasing list of durations
-  unsigned long counter_; // record counter, assume total records won't exceed 2^64-1
+  unsigned long counter_;  // record counter, assume total records won't exceed 2^64-1
 
   void add_record(double);
 };
