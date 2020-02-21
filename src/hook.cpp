@@ -237,7 +237,7 @@ int establish_connection() {
  * Send a request and receive a response.
  * Only one thread can communicate at the same time.
  * @param sbuf buffer with the data to send.
- * @param rbug buffer which will be filled with received data.
+ * @param rbuf buffer which will be filled with received data.
  * @param socket_timeout socket timeout (second), 0 means never timeout
  * @return buffer with received data
  */
@@ -428,8 +428,6 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
 
   // check if token expired
   pthread_mutex_lock(&expiration_status_mutex);
-  // ISSUE: if kernel burst > quota, client will ask for quota every time it launches a kernel
-  // consider limit the size of a kernel burst
   if (us_since(request_start) / 1e3 + burst_predictor.predict_remain() >= quota_time) {
     pred_burst = burst_predictor.predict_ctxfree();
     pred_window = window_predictor.predict_ctxfree();
@@ -443,6 +441,7 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
     }
     pthread_mutex_unlock(&overuse_trk_mutex);
 
+    // interrupt the window which is started when overuse tracking completes
     window_predictor.interrupt();
 
     new_quota = get_token_from_scheduler(pred_burst, pred_window);

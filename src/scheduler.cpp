@@ -159,13 +159,12 @@ double ClientInfo::get_max_fraction() { return MAX_FRAC; }
 // self-adaptive quota algorithm
 double ClientInfo::get_quota() {
   const double UPDATE_RATE = 0.5;  // how drastically will the quota changes
-  double best_fit, new_quota;
+  double new_quota;
 
   if (latest_burst_ < 1e-9) {
     // special case when no burst data available
     quota_ = latest_actual_usage_;
   } else {
-    // best_fit = ceil(BASE_QUOTA / latest_burst_) * latest_burst_;
     new_quota = latest_burst_;
     // if latest window is small, client must be in active usage
     if (latest_window_ <= SCHD_OVERHEAD) new_quota *= 2;  // boost the quota

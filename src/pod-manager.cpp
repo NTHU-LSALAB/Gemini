@@ -77,10 +77,6 @@ uint32_t req_cnt = 0;
 pthread_mutex_t req_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t req_queue_cond = PTHREAD_COND_INITIALIZER;
 
-std::map<reqid_t, request> pending_request_map;
-pthread_mutex_t pending_req_mutex = PTHREAD_MUTEX_INITIALIZER;
-// pthread_cond_t pending_req_cond = PTHREAD_COND_INITIALIZER;
-
 struct response {
   void *data;
 };
@@ -111,7 +107,6 @@ char pod_name[HOST_NAME_MAX];
 
 // retrieve memory limit information from scheduler
 int retrieve_mem_info(int sockfd, const int MAX_RETRY, const long RETRY_TIMEOUT) {
-  // retry settings when failed to reach scheduler
   int rc;
   char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   size_t pos = 0;
@@ -130,11 +125,12 @@ int retrieve_mem_info(int sockfd, const int MAX_RETRY, const long RETRY_TIMEOUT)
         return 0;
       },
       MAX_RETRY, 0);
-  if (rc != 0) return rc;
 
   // disable timeout option
   tv.tv_sec = 0;
   setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  if (rc != 0) return rc;  // failed to get memory info from scheduler
 
   // parse received data and get memory limit
   attached = parse_response(rbuf, nullptr);
@@ -185,8 +181,9 @@ int main(int argc, char *argv[]) {
   // create socket
   int schd_sockfd = socket(PF_INET, SOCK_STREAM, 0);
   if (schd_sockfd == -1) {
-    ERROR("failed to create socket: %s", strerror(errno));
-    exit(errno);
+    int err = errno;
+    ERROR("failed to create socket: %s", strerror(err));
+    exit(err);
   }
 
   // setup socket info
