@@ -27,6 +27,7 @@
 using std::make_pair;
 using std::chrono::duration_cast;
 using std::chrono::microseconds;
+using std::chrono::milliseconds;
 using std::chrono::steady_clock;
 
 Predictor::Predictor(const char *name, const double thres) : MERGE_THRES(thres) {
@@ -35,21 +36,23 @@ Predictor::Predictor(const char *name, const double thres) : MERGE_THRES(thres) 
   last_period_begin_ = timepoint_t::max();
   last_period_end_ = timepoint_t::min();
   upperbound_ = std::numeric_limits<double>::max();
-  counter_ = 0;
   name_ = name;
 }
 
 Predictor::~Predictor() { pthread_mutex_destroy(&mutex_); }
 
 // maintains the decreasing property, for O(1) time complexity
-void Predictor::add_record(double duration) {
-  // remove outdated records
-  while (!past_records_.empty() && counter_ - past_records_.front().first > PREDICT_MAX_KEEP)
-    past_records_.pop_front();
+void Predictor::add_record(const double duration, const timepoint_t tp) {
   // maintain a decreasing list
   while (!past_records_.empty() && past_records_.back().second < duration) past_records_.pop_back();
-  past_records_.push_back(make_pair(counter_, duration));
-  ++counter_;
+  past_records_.push_back(make_pair(tp, duration));
+}
+
+// remove records which are PREDICT_MAX_KEEP milliseconds before tp
+void Predictor::drop_outdated_record(const timepoint_t tp) {
+  while (!past_records_.empty() &&
+         duration_cast<milliseconds>(tp - past_records_.front().first).count() > PREDICT_MAX_KEEP)
+    past_records_.pop_front();
 }
 
 // Marks complete for a period
@@ -63,7 +66,8 @@ void Predictor::record_stop() {
     // record duration
     tp = steady_clock::now();
     duration = duration_cast<microseconds>(tp - period_begin_).count() / 1e3;
-    add_record(duration);
+    drop_outdated_record(tp);
+    add_record(duration, tp);
     last_period_end_ = tp;
     DEBUG("%s: record stop (length: %.3f ms)", name_, duration);
   }
@@ -83,7 +87,6 @@ void Predictor::record_start() {
     if (last_period_end_ != timepoint_t::min() && period_intv < MERGE_THRES) {
       DEBUG("%s: merge", name_);
       period_begin_ = last_period_begin_;
-      --counter_;
     }
 
     last_period_begin_ = period_begin_;
@@ -117,6 +120,9 @@ double Predictor::predict_remain() {
   now = steady_clock::now();
   intv = duration_cast<microseconds>(now - last_period_end_).count() / 1e3;
 
+  // update past_records_
+  drop_outdated_record(now);
+
   if (!past_records_.empty()) {
     // enforce an upperbound
     time_remain = std::min(past_records_.front().second, upperbound_);
@@ -139,6 +145,9 @@ double Predictor::predict_ctxfree() {
 
 #ifndef NO_PREDICT
   pthread_mutex_lock(&mutex_);
+  // update past_records_
+  drop_outdated_record(steady_clock::now());
+
   if (!past_records_.empty()) pred = past_records_.front().second;
   pthread_mutex_unlock(&mutex_);
 #endif
@@ -161,7 +170,6 @@ void Predictor::reset() {
   period_begin_ = timepoint_t::max();
   last_period_begin_ = timepoint_t::max();
   last_period_end_ = timepoint_t::min();
-  counter_ = 0;
   pthread_mutex_unlock(&mutex_);
 #endif
 }
