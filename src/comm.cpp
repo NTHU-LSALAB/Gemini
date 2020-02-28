@@ -51,7 +51,6 @@ reqid_t prepare_request(char *buf, comm_request_t type, ...) {
     va_start(vl, 3);
     append_msg_data(buf, pos, va_arg(vl, double));  // overuse
     append_msg_data(buf, pos, va_arg(vl, double));  // burst duration
-    append_msg_data(buf, pos, va_arg(vl, double));  // window period
     va_end(vl);
   } else if (type == REQ_MEM_UPDATE) {
     va_start(vl, 2);

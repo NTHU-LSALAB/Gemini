@@ -93,7 +93,6 @@ pthread_mutex_t mem_info_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef time_point<steady_clock> quota_tp;
 double pod_overuse_ms = 0.0;
 std::map<int, double> client_burst_map;
-std::map<int, double> client_window_map;
 pthread_mutex_t client_stat_mutex = PTHREAD_MUTEX_INITIALIZER;
 double pod_quota = 0.0;
 quota_tp quota_updated_tp;
@@ -256,8 +255,6 @@ int main(int argc, char *argv[]) {
     // create client statistics entries
     pthread_mutex_lock(&client_stat_mutex);
     client_burst_map.insert(std::make_pair(client_sockfd, 0.0));
-    client_window_map.insert(
-        std::make_pair(client_sockfd, std::numeric_limits<double>::infinity()));
     pthread_mutex_unlock(&client_stat_mutex);
 
     // create a thread for each client
@@ -300,7 +297,7 @@ int hook_update_memory_usage(size_t mem_size, int allocate, int sockfd) {
 }
 
 // handle kernel launch request, return remaining quota time (ms)
-double hook_kernel_launch(int sockfd, double overuse_ms, double burst, double window) {
+double hook_kernel_launch(int sockfd, double overuse_ms, double burst) {
   // wait if someone else is working with quota
   while (true) {
     pthread_mutex_lock(&quota_state_mutex);
@@ -320,7 +317,6 @@ double hook_kernel_launch(int sockfd, double overuse_ms, double burst, double wi
   // update statistics for this client
   pthread_mutex_lock(&client_stat_mutex);
   client_burst_map[sockfd] = burst;
-  client_window_map[sockfd] = window;
   pthread_mutex_unlock(&client_stat_mutex);
 
   quota_tp now_tp = steady_clock::now();
@@ -333,7 +329,6 @@ double hook_kernel_launch(int sockfd, double overuse_ms, double burst, double wi
     bool complete = false;
     size_t rpos = 0;
     double max_burst = 0.0;
-    double min_window = std::numeric_limits<double>::infinity();
 
     // update quota state: updating quota
     pthread_mutex_lock(&quota_state_mutex);
@@ -343,14 +338,13 @@ double hook_kernel_launch(int sockfd, double overuse_ms, double burst, double wi
     // calculate estimation values
     pthread_mutex_lock(&client_stat_mutex);
     for (auto x : client_burst_map) max_burst = std::max(x.second, max_burst);
-    for (auto x : client_window_map) min_window = std::min(x.second, min_window);
     pthread_mutex_unlock(&client_stat_mutex);
 
     // place request into request queue
     pthread_mutex_lock(&req_queue_mutex);
     sbuf = new char[REQ_MSG_LEN];
     bzero(sbuf, REQ_MSG_LEN);
-    req_id = prepare_request(sbuf, REQ_QUOTA, pod_overuse_ms, max_burst, min_window);
+    req_id = prepare_request(sbuf, REQ_QUOTA, pod_overuse_ms, max_burst);
     request_queue.push({req_id, sbuf});
     // wake scheduler thread up
     pthread_cond_signal(&req_queue_cond);
@@ -415,8 +409,7 @@ void *hook_thread_func(void *args) {
       // check if there is available quota
       double overuse_ms = get_msg_data<double>(attached, pos);
       double burst = get_msg_data<double>(attached, pos);
-      double window = get_msg_data<double>(attached, pos);
-      double quota_remain = hook_kernel_launch(sockfd, overuse_ms, burst, window);
+      double quota_remain = hook_kernel_launch(sockfd, overuse_ms, burst);
 
       // return remaining quota time
       len = prepare_response(sbuf, REQ_QUOTA, rid, quota_remain);
@@ -441,7 +434,6 @@ void *hook_thread_func(void *args) {
 
   pthread_mutex_lock(&client_stat_mutex);
   client_burst_map.erase(sockfd);
-  client_window_map.erase(sockfd);
   pthread_mutex_unlock(&client_stat_mutex);
 
   close(sockfd);

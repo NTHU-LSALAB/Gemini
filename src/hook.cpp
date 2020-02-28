@@ -157,8 +157,8 @@ double overuse = 0;     // overuse time (ms)
 pthread_mutex_t request_time_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // predictors
-const double SCHD_OVERHEAD = 2.0;  // ms
-Predictor burst_predictor("burst", SCHD_OVERHEAD);
+const double SCHD_OVERHEAD = 2.0;                   // ms
+Predictor burst_predictor("burst", SCHD_OVERHEAD);  // predicted burst may not be the full burst
 Predictor window_predictor("window");
 
 pthread_mutex_t expiration_status_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -320,19 +320,44 @@ int update_memory_usage(size_t bytes, int is_allocate) {
 }
 
 /**
+ * estimate the length of a complete burst
+ * @param measured_burst the length of a kernel burst measured by Predictor
+ * @param measured_window the length of a window period measured by Predictor
+ * @return estimated length of a complete burst
+ */
+double estimate_full_burst(double measured_burst, double measured_window) {
+  double full_burst;
+
+  if (measured_burst < 1e-9) {
+    // no valid burst data
+    full_burst = 0.0;
+  } else {
+    full_burst = measured_burst;
+    // If application is actively using GPU, we might have a incomplete burst.
+    // Therefore we increase the estimated burst time.
+    if (measured_window < SCHD_OVERHEAD) full_burst *= 2;  // '2' can be changed to any value > 1
+  }
+
+  DEBUG("measured burst: %.3f ms, window: %.3f ms, estimated full burst: %.3f ms", measured_burst,
+        measured_window, full_burst);
+
+  return full_burst;
+}
+
+/**
  * send token request to scheduling system
- * @param pred_burst predicted kernel burst (milliseconds)
+ * @param pred_full_burst predicted kernel burst (milliseconds)
  * @param pred_window predicted window period (milliseconds)
  * @return received time quota (milliseconds)
  */
-double get_token_from_scheduler(double pred_burst, double pred_window) {
+double get_token_from_scheduler(double pred_full_burst) {
   char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   size_t rpos = 0;
   int rc;
   double new_quota;
 
   bzero(sbuf, REQ_MSG_LEN);
-  prepare_request(sbuf, REQ_QUOTA, overuse, pred_burst, pred_window);
+  prepare_request(sbuf, REQ_QUOTA, overuse, pred_full_burst);
 
   // retrieve token from scheduler
   rc = communicate(sbuf, rbuf, 0);
@@ -422,16 +447,16 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
                                 unsigned int blockDimY, unsigned int blockDimZ,
                                 unsigned int sharedMemBytes, CUstream hStream, void **kernelParams,
                                 void **extra) {
-  double new_quota, pred_burst, pred_window;
+  double new_quota, pred_full_burst;
 
   window_predictor.record_stop();
 
   // check if token expired
   pthread_mutex_lock(&expiration_status_mutex);
   if (us_since(request_start) / 1e3 + burst_predictor.predict_remain() >= quota_time) {
-    pred_burst = burst_predictor.predict_ctxfree();
-    pred_window = window_predictor.predict_ctxfree();
-    DEBUG("burst: %.3f ms, window: %.3f ms", pred_burst, pred_window);
+    pred_full_burst =
+        estimate_full_burst(burst_predictor.predict_ctxfree(), window_predictor.predict_ctxfree());
+
     // wait for all kernels finish
     pthread_mutex_lock(&overuse_trk_mutex);
     if (!overuse_trk_cmpl) {
@@ -444,7 +469,7 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
     // interrupt the window which is started when overuse tracking completes
     window_predictor.interrupt();
 
-    new_quota = get_token_from_scheduler(pred_burst, pred_window);
+    new_quota = get_token_from_scheduler(pred_full_burst);
 
     // ensure predicted kernel burst is always less than quota
     burst_predictor.set_upperbound(new_quota - 1.0);
@@ -646,7 +671,7 @@ void initialize() {
 
   // first token request
   overuse_trk_cmpl = true;  // bypass first overuse tracking to prevent deadlock
-  get_token_from_scheduler(0, 0);
+  get_token_from_scheduler(0.0);
 
   pthread_mutex_unlock(&request_time_mutex);
 }

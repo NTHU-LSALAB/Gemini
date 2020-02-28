@@ -110,16 +110,14 @@ inline double ms_since_start() {
 ClientInfo::ClientInfo(double baseq, double minq, double maxq, double minf, double maxf)
     : BASE_QUOTA(baseq), MIN_QUOTA(minq), MAX_QUOTA(maxq), MIN_FRAC(minf), MAX_FRAC(maxf) {
   quota_ = BASE_QUOTA;
+  latest_overuse_ = 0.0;
   latest_actual_usage_ = 0.0;
-  latest_burst_ = 0.0;
-  latest_window_ = std::numeric_limits<double>::max();
+  burst_ = 0.0;
 };
 
 ClientInfo::~ClientInfo(){};
 
-void ClientInfo::set_burst(double burst) { latest_burst_ = burst; }
-
-void ClientInfo::set_window(double window) { latest_window_ = window; }
+void ClientInfo::set_burst(double estimated_burst) { burst_ = estimated_burst; }
 
 void ClientInfo::update_return_time(double overuse) {
   double now = ms_since_start();
@@ -131,6 +129,7 @@ void ClientInfo::update_return_time(double overuse) {
       break;
     }
   }
+  latest_overuse_ = overuse;
 #ifdef _DEBUG
   for (auto it = full_history.rbegin(); it != full_history.rend(); it++) {
     if (it->name == this->name) {
@@ -159,24 +158,20 @@ double ClientInfo::get_max_fraction() { return MAX_FRAC; }
 // self-adaptive quota algorithm
 double ClientInfo::get_quota() {
   const double UPDATE_RATE = 0.5;  // how drastically will the quota changes
-  double new_quota;
 
-  if (latest_burst_ < 1e-9) {
+  if (burst_ < 1e-9) {
     // special case when no burst data available
-    quota_ = latest_actual_usage_;
+    quota_ = latest_actual_usage_ * UPDATE_RATE + quota_ * (1 - UPDATE_RATE);
+    quota_ = std::max(quota_, MIN_QUOTA);                    // lowerbound
+    quota_ = std::min(quota_, MAX_QUOTA - latest_overuse_);  // upperbound
+    DEBUG("%s: no burst data, latest usage: %.3fms, assign quota: %.3fms", name.c_str(),
+          latest_actual_usage_, quota_);
   } else {
-    new_quota = latest_burst_;
-    // if latest window is small, client must be in active usage
-    if (latest_window_ <= SCHD_OVERHEAD) new_quota *= 2;  // boost the quota
-
-    quota_ = new_quota * UPDATE_RATE + quota_ * (1 - UPDATE_RATE);
+    quota_ = burst_ * UPDATE_RATE + quota_ * (1 - UPDATE_RATE);
+    quota_ = std::max(quota_, MIN_QUOTA);  // lowerbound
+    quota_ = std::min(quota_, MAX_QUOTA);  // upperbound
+    DEBUG("%s: burst: %.3fms, assign quota: %.3fms", name.c_str(), burst_, quota_);
   }
-
-  quota_ = std::max({quota_, MIN_QUOTA, latest_burst_ + EXTRA_QUOTA});  // lowerbound
-  quota_ = std::min(quota_, MAX_QUOTA);                                 // upperbound
-
-  DEBUG("%s: latest usage = %.3f ms, burst = %.3f ms, window = %.3f ms, give quota = %.3f ms",
-        name.c_str(), latest_actual_usage_, latest_burst_, latest_window_, quota_);
   return quota_;
 }
 
@@ -425,11 +420,9 @@ void handle_message(int client_sock, char *message) {
     double overuse, burst, window;
     overuse = get_msg_data<double>(attached, offset);
     burst = get_msg_data<double>(attached, offset);
-    window = get_msg_data<double>(attached, offset);
 
     client_inf->update_return_time(overuse);
     client_inf->set_burst(burst);
-    client_inf->set_window(window);
     pthread_mutex_lock(&candidate_mutex);
     candidates.push_back({client_sock, string(client_name), req_id, ms_since_start()});
     pthread_cond_signal(&candidate_cond);  // wake schedule_daemon_func up
@@ -441,7 +434,7 @@ void handle_message(int client_sock, char *message) {
     send(client_sock, sbuf, RSP_MSG_LEN, 0);
   } else if (req == REQ_MEM_UPDATE) {
     // ***for communication interface compatibility only***
-    // actual memory usage is not being tracked when hook library directly connects to scheduler
+    // memory usage is only tracked on hook library side
     WARNING("scheduler always returns true for memory usage update!");
     prepare_response(sbuf, REQ_MEM_UPDATE, req_id, 1);
     send(client_sock, sbuf, RSP_MSG_LEN, 0);

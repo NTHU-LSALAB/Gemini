@@ -38,7 +38,6 @@ class ClientInfo {
   ClientInfo(double baseq, double minq, double maxq, double minf, double maxf);
   ~ClientInfo();
   void set_burst(double burst);
-  void set_window(double window);
   void update_return_time(double overuse);
   void Record(double quota);
   double get_min_fraction();
@@ -55,9 +54,9 @@ class ClientInfo {
   const double MIN_QUOTA;   // from command line argument
   const double MAX_QUOTA;   // calculated from time window and max fraction
   double quota_;
+  double latest_overuse_;
   double latest_actual_usage_;  // client may return eariler (before quota expire)
-  double latest_burst_;         // duration of kernel burst
-  double latest_window_;        // duration of window period
+  double burst_;                // duration of kernel burst
 };
 
 // the connection to specific container
