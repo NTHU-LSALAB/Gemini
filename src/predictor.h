@@ -26,6 +26,19 @@ typedef std::chrono::time_point<std::chrono::_V2::steady_clock> timepoint_t;
 
 const int64_t PREDICT_MAX_KEEP = 10000;  // maximum time a record will be kept (in milliseconds)
 
+class RecordKeeper {
+ public:
+  RecordKeeper(const int64_t);
+  void add(const double, const timepoint_t);
+  void drop_outdated(const timepoint_t);
+  void clear();
+  double get_max();
+
+ private:
+  const int64_t VALID_TIME;
+  std::deque<std::pair<timepoint_t, double>> records_;
+};
+
 class Predictor {
  public:
   Predictor(const char *name = "", const double thres = 0.0);
@@ -44,12 +57,9 @@ class Predictor {
   const double MERGE_THRES;
   pthread_mutex_t mutex_;
   timepoint_t period_begin_;
-  timepoint_t last_period_begin_, last_period_end_;
-  std::deque<std::pair<timepoint_t, double>> past_records_;  // a decreasing list of durations
+  timepoint_t long_period_begin_, long_period_end_;
+  RecordKeeper normal_records, long_records;
   double upperbound_;
-
-  void add_record(const double, const timepoint_t);
-  void drop_outdated_record(const timepoint_t tp);
 };
 
 #endif
