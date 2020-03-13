@@ -410,7 +410,7 @@ void *wait_cuda_kernels(void *args) {
     cudaEventSynchronize(event);
 
     // notify predictor we've done a synchronize
-    burst_predictor.interrupt();
+    burst_predictor.record_stop();  // a smaller burst
     window_predictor.record_start();
 
     float elapsed_ms;
