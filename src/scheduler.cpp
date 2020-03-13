@@ -160,12 +160,9 @@ double ClientInfo::get_quota() {
   const double UPDATE_RATE = 0.5;  // how drastically will the quota changes
 
   if (burst_ < 1e-9) {
-    // special case when no burst data available
-    quota_ = latest_actual_usage_ * UPDATE_RATE + quota_ * (1 - UPDATE_RATE);
-    quota_ = std::max(quota_, MIN_QUOTA);                    // lowerbound
-    quota_ = std::min(quota_, MAX_QUOTA - latest_overuse_);  // upperbound
-    DEBUG("%s: no burst data, latest usage: %.3fms, assign quota: %.3fms", name.c_str(),
-          latest_actual_usage_, quota_);
+    // special case when no burst data available, just fallback to static quota
+    quota_ = BASE_QUOTA;
+    DEBUG("%s: fallback to static quota, assign quota: %.3fms", name.c_str(), quota_);
   } else {
     quota_ = burst_ * UPDATE_RATE + quota_ * (1 - UPDATE_RATE);
     quota_ = std::max(quota_, MIN_QUOTA);  // lowerbound
