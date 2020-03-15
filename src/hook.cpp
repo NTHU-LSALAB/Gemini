@@ -477,9 +477,6 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
     cudaEventRecord(cuevent_start, 0);
     clock_gettime(CLOCK_MONOTONIC, &request_start);  // time
 
-    // if quota changed, window period may also change
-    if (abs(new_quota - quota_time) > 1e-3) window_predictor.reset();
-
     quota_time = new_quota;
 
     // wake overuse tracking thread up
