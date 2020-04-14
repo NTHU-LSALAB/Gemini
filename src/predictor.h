@@ -24,7 +24,7 @@
 
 typedef std::chrono::time_point<std::chrono::_V2::steady_clock> timepoint_t;
 
-const int64_t PREDICT_MAX_KEEP = 10000;  // maximum time a record will be kept (in milliseconds)
+const int64_t PREDICT_MAX_KEEP = 3000;  // maximum time a record will be kept (in milliseconds)
 
 class RecordKeeper {
  public:
