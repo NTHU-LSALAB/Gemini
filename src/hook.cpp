@@ -520,36 +520,51 @@ CUresult cuMipmappedArrayDestroy_prehook(CUmipmappedArray hMipmappedArray) {
   return cuMemFree_prehook((CUdeviceptr)hMipmappedArray);
 }
 
-// check memory limit and record memory usage
+// ask backend whether there's enough memory or not
+CUresult cuMemAlloc_prehook(CUdeviceptr *dptr, size_t bytesize) {
+  size_t remain, limit;
+
+  std::tie(remain, limit) = get_gpu_memory_info();
+
+  // block allocation request before over-allocate
+  if (bytesize > remain) {
+    ERROR("Allocate too much memory! (request: %lu B, remain: %lu B)", bytesize, remain);
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
+
+  return CUDA_SUCCESS;
+}
+
+// push memory allocation information to backend
 CUresult cuMemAlloc_posthook(CUdeviceptr *dptr, size_t bytesize) {
+  // send memory usage update to backend
+  if (!update_memory_usage(bytesize, 1)) {
+    ERROR("Allocate too much memory!");
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
+
   pthread_mutex_lock(&allocation_mutex);
-  bool success = true;
-  auto pod_mem_info = get_gpu_memory_info();
-  if (pod_mem_info.second < gpu_mem_used + bytesize) {
-    // check locally
-    ERROR("Allocate too much memory!");
-    success = false;
-  } else if (!update_memory_usage(bytesize, 1)) {
-    // check globally
-    ERROR("Allocate too much memory!");
-    success = false;
-  }
-  if (success) {
-    allocation_map[*dptr] = bytesize;
-    gpu_mem_used += bytesize;
-  }
+  allocation_map[*dptr] = bytesize;
+  gpu_mem_used += bytesize;
   pthread_mutex_unlock(&allocation_mutex);
-  if (!success) exit(-2);
+
+  return CUDA_SUCCESS;
+}
+
+CUresult cuMemAllocManaged_prehook(CUdeviceptr *dptr, size_t bytesize, unsigned int flags) {
+  // TODO: This function access the unified memory. Behavior needs clarification.
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemAllocManaged_posthook(CUdeviceptr *dptr, size_t bytesize, unsigned int flags) {
-  // TODO: This function access the unified memory
-  // TODO: This behavier needs to be clarified
-  // return cuMemAlloc_hook(dptr, bytesize);
+  // TODO: This function access the unified memory. Behavior needs clarification.
   return CUDA_SUCCESS;
 }
 
+CUresult cuMemAllocPitch_prehook(CUdeviceptr *dptr, size_t *pPitch, size_t WidthInBytes,
+                                 size_t Height, unsigned int ElementSizeBytes) {
+  return cuMemAlloc_prehook(dptr, (*pPitch) * Height);
+}
 CUresult cuMemAllocPitch_posthook(CUdeviceptr *dptr, size_t *pPitch, size_t WidthInBytes,
                                   size_t Height, unsigned int ElementSizeBytes) {
   return cuMemAlloc_posthook(dptr, (*pPitch) * Height);
@@ -571,11 +586,25 @@ inline size_t CUarray_format_to_size_t(CUarray_format Format) {
   }
 }
 
+CUresult cuArrayCreate_prehook(CUarray *pHandle, const CUDA_ARRAY_DESCRIPTOR *pAllocateArray) {
+  size_t totalMemoryNumber =
+      pAllocateArray->Width * pAllocateArray->Height * pAllocateArray->NumChannels;
+  size_t formatSize = CUarray_format_to_size_t(pAllocateArray->Format);
+  return cuMemAlloc_prehook((CUdeviceptr *)pHandle, totalMemoryNumber * formatSize);
+}
+
 CUresult cuArrayCreate_posthook(CUarray *pHandle, const CUDA_ARRAY_DESCRIPTOR *pAllocateArray) {
   size_t totalMemoryNumber =
       pAllocateArray->Width * pAllocateArray->Height * pAllocateArray->NumChannels;
   size_t formatSize = CUarray_format_to_size_t(pAllocateArray->Format);
   return cuMemAlloc_posthook((CUdeviceptr *)pHandle, totalMemoryNumber * formatSize);
+}
+
+CUresult cuArray3DCreate_prehook(CUarray *pHandle, const CUDA_ARRAY3D_DESCRIPTOR *pAllocateArray) {
+  size_t totalMemoryNumber = pAllocateArray->Width * pAllocateArray->Height *
+                             pAllocateArray->Depth * pAllocateArray->NumChannels;
+  size_t formatSize = CUarray_format_to_size_t(pAllocateArray->Format);
+  return cuMemAlloc_prehook((CUdeviceptr *)pHandle, totalMemoryNumber * formatSize);
 }
 
 CUresult cuArray3DCreate_posthook(CUarray *pHandle, const CUDA_ARRAY3D_DESCRIPTOR *pAllocateArray) {
@@ -585,11 +614,17 @@ CUresult cuArray3DCreate_posthook(CUarray *pHandle, const CUDA_ARRAY3D_DESCRIPTO
   return cuMemAlloc_posthook((CUdeviceptr *)pHandle, totalMemoryNumber * formatSize);
 }
 
+CUresult cuMipmappedArrayCreate_prehook(CUmipmappedArray *pHandle,
+                                        const CUDA_ARRAY3D_DESCRIPTOR *pMipmappedArrayDesc,
+                                        unsigned int numMipmapLevels) {
+  // TODO: check mipmap array size
+  return CUDA_SUCCESS;
+}
+
 CUresult cuMipmappedArrayCreate_posthook(CUmipmappedArray *pHandle,
                                          const CUDA_ARRAY3D_DESCRIPTOR *pMipmappedArrayDesc,
                                          unsigned int numMipmapLevels) {
   // TODO: check mipmap array size
-  // return cuMemAlloc_posthook(pHandle, totalMemory);
   return CUDA_SUCCESS;
 }
 
@@ -652,6 +687,13 @@ void initialize() {
   hook_inf.preHooks[CU_HOOK_LAUNCH_KERNEL] = (void *)cuLaunchKernel_prehook;
   hook_inf.preHooks[CU_HOOK_LAUNCH_COOPERATIVE_KERNEL] = (void *)cuLaunchCooperativeKernel_prehook;
 
+  hook_inf.preHooks[CU_HOOK_MEM_ALLOC] = (void *)cuMemAlloc_prehook;
+  hook_inf.preHooks[CU_HOOK_MEM_ALLOC_MANAGED] = (void *)cuMemAllocManaged_prehook;
+  hook_inf.preHooks[CU_HOOK_MEM_ALLOC_PITCH] = (void *)cuMemAllocPitch_prehook;
+  hook_inf.preHooks[CU_HOOK_ARRAY_CREATE] = (void *)cuArrayCreate_prehook;
+  hook_inf.preHooks[CU_HOOK_ARRAY3D_CREATE] = (void *)cuArray3DCreate_prehook;
+  hook_inf.preHooks[CU_HOOK_MIPMAPPED_ARRAY_CREATE] = (void *)cuMipmappedArrayCreate_prehook;
+
   configure_connection();
   pthread_mutex_lock(&request_time_mutex);
   cudaEventCreate(&cuevent_start);
@@ -686,12 +728,13 @@ CUstream hStream;  // redundent variable used for macro expansion
     if (hook_inf.debug_mode) hook_inf.call_count[hooksymbol]++;                           \
                                                                                           \
     if (hook_inf.preHooks[hooksymbol])                                                    \
-      ((CUresult CUDAAPI(*) params)hook_inf.preHooks[hooksymbol])(__VA_ARGS__);           \
+      result = ((CUresult CUDAAPI(*) params)hook_inf.preHooks[hooksymbol])(__VA_ARGS__);  \
+    if (result != CUDA_SUCCESS) return (result);                                          \
                                                                                           \
     result = ((CUresult CUDAAPI(*) params)real_func)(__VA_ARGS__);                        \
                                                                                           \
     if (hook_inf.postHooks[hooksymbol] && result == CUDA_SUCCESS)                         \
-      ((CUresult CUDAAPI(*) params)hook_inf.postHooks[hooksymbol])(__VA_ARGS__);          \
+      result = ((CUresult CUDAAPI(*) params)hook_inf.postHooks[hooksymbol])(__VA_ARGS__); \
                                                                                           \
     return (result);                                                                      \
   }
