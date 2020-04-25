@@ -266,6 +266,18 @@ int communicate(char *sbuf, char *rbuf, int socket_timeout) {
 }
 
 /**
+ * Record a host-side synchronous call and update predictor statistics.
+ * @param func_name name of synchronous call
+ */
+void host_sync_call(const char *func_name) {
+#ifdef SYNCP_MESSAGE
+  DEBUG("SYNC (%s)", func_name);
+#endif
+  burst_predictor.record_stop();
+  window_predictor.record_start();
+}
+
+/**
  * get available GPU memory from Pod manager/scheduler
  * assume user memory limit won't exceed hardware limit
  * @return remaining memory, memory limit
@@ -410,8 +422,7 @@ void *wait_cuda_kernels(void *args) {
     cudaEventSynchronize(event);
 
     // notify predictor we've done a synchronize
-    burst_predictor.record_stop();  // a smaller burst
-    window_predictor.record_start();
+    host_sync_call("overuse measurement");
 
     float elapsed_ms;
     cudaEventElapsedTime(&elapsed_ms, cuevent_start, event);
@@ -431,16 +442,6 @@ void *wait_cuda_kernels(void *args) {
 /**
  * pre-hooks and post-hooks
  */
-#ifdef SYNCP_MESSAGE
-#define SYNCP()                        \
-  struct timespec ts;                  \
-  clock_gettime(CLOCK_MONOTONIC, &ts); \
-  printf("[%d.%06d] SYNC,%s\n", tv.tv_sec, tv.tv_nsec / 1000, __FUNCTION__);
-
-#else
-#define SYNCP()
-
-#endif
 
 CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
                                 unsigned int gridDimZ, unsigned int blockDimX,
@@ -629,40 +630,30 @@ CUresult cuMipmappedArrayCreate_posthook(CUmipmappedArray *pHandle,
 }
 
 CUresult cuCtxSynchronize_posthook(void) {
-  SYNCP();
-  burst_predictor.record_stop();
-  window_predictor.record_start();
+  host_sync_call("cuCtxSynchronize");
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemcpyAtoH_posthook(void *dstHost, CUarray srcArray, size_t srcOffset,
                                size_t ByteCount) {
-  SYNCP();
-  burst_predictor.record_stop();
-  window_predictor.record_start();
+  host_sync_call("cuMemcpyAtoH");
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemcpyDtoH_posthook(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
-  SYNCP();
-  burst_predictor.record_stop();
-  window_predictor.record_start();
+  host_sync_call("cuMemcpyDtoH");
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemcpyHtoA_posthook(CUarray dstArray, size_t dstOffset, const void *srcHost,
                                size_t ByteCount) {
-  SYNCP();
-  burst_predictor.record_stop();
-  window_predictor.record_start();
+  host_sync_call("cuMemcpyHtoA");
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemcpyHtoD_posthook(CUarray dstArray, size_t dstOffset, const void *srcHost,
                                size_t ByteCount, CUstream hStream) {
-  SYNCP();
-  burst_predictor.record_stop();
-  window_predictor.record_start();
+  host_sync_call("cuMemcpyHtoD");
   return CUDA_SUCCESS;
 }
 
