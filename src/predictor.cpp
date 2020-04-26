@@ -16,6 +16,9 @@
 
 /**
  * Kernel burst and window period measurement/prediction utilities.
+ * There are two types of prediction result: plain (unmerged) and merged.
+ * Plain (unmerged) results are results of a single period/burst.
+ * Merged results are results of several consecutive periods/bursts.
  *
  * Measurement and prediction can be disabled by defining NO_PREDICT.
  */
@@ -70,6 +73,12 @@ Predictor::Predictor(const char *name, const double thres)
 
 Predictor::~Predictor() { pthread_mutex_destroy(&mutex_); }
 
+// Check whether we're in an active burst/period.
+bool Predictor::ongoing_unmerged() { return period_begin_ != timepoint_t::max(); }
+
+// Check whether we're in an active long-burst/long-period.
+bool Predictor::ongoing_merged() { return long_period_begin_ != timepoint_t::max(); }
+
 // Marks complete for a period
 void Predictor::record_stop() {
 #ifndef NO_PREDICT
@@ -77,7 +86,7 @@ void Predictor::record_stop() {
   timepoint_t tp;
 
   pthread_mutex_lock(&mutex_);
-  if (period_begin_ != timepoint_t::max()) {
+  if (ongoing_unmerged()) {
     // record duration
     tp = steady_clock::now();
     duration = duration_cast<microseconds>(tp - period_begin_).count() / 1e3;
@@ -97,12 +106,12 @@ void Predictor::record_start() {
 #ifndef NO_PREDICT
   double intv;
   pthread_mutex_lock(&mutex_);
-  if (period_begin_ == timepoint_t::max()) {
+  if (!ongoing_unmerged()) {
     period_begin_ = steady_clock::now();
 
     intv = duration_cast<microseconds>(period_begin_ - long_period_end_).count() / 1e3;
     // long period did not started || last long period too long ago
-    if (long_period_begin_ == timepoint_t::max() || intv > MERGE_THRES) {
+    if (!ongoing_merged() || intv > MERGE_THRES) {
       long_period_begin_ = period_begin_;
       long_period_end_ = timepoint_t::min();
     }
@@ -126,32 +135,22 @@ void Predictor::interrupt() {
 #endif
 }
 
-// Get remaining time of current period.
-double Predictor::predict_remain() {
-  double time_remain = 0;
+// Get predicted length of an unmerged burst/period.
+double Predictor::predict_unmerged() {
+  double pred = 0.0;
   timepoint_t now;
 
 #ifndef NO_PREDICT
   pthread_mutex_lock(&mutex_);
-
-  now = steady_clock::now();
-
-  // update records
-  normal_records.drop_outdated(now);
-
-  time_remain = std::min(normal_records.get_max(), upperbound_);
-  if (period_begin_ != timepoint_t::max())
-    time_remain -= duration_cast<microseconds>(now - period_begin_).count() / 1e3;
-  if (time_remain < 0.0) time_remain = 0.0;
-
-  DEBUG("%s: period remain = %.3f", name_, time_remain);
+  normal_records.drop_outdated(steady_clock::now());
+  pred = normal_records.get_max();
   pthread_mutex_unlock(&mutex_);
 #endif
-  return time_remain;
+  return pred;
 }
 
-// Get the duration of a full period. Mini-period == Full period when no merge occurs.
-double Predictor::predict_ctxfree() {
+// Get predicted length of a (possibly) merged period.
+double Predictor::predict_merged() {
   double pred = 0.0;
 
 #ifndef NO_PREDICT

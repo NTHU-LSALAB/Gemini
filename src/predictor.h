@@ -46,8 +46,10 @@ class Predictor {
   void record_stop();
   void record_start();
   void interrupt();
-  double predict_remain();
-  double predict_ctxfree();
+  bool ongoing_unmerged();
+  bool ongoing_merged();
+  double predict_unmerged();
+  double predict_merged();
   void set_upperbound(const double bound);
   void reset();
 

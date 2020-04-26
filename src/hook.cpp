@@ -358,18 +358,17 @@ double estimate_full_burst(double measured_burst, double measured_window) {
 
 /**
  * send token request to scheduling system
- * @param pred_full_burst predicted kernel burst (milliseconds)
- * @param pred_window predicted window period (milliseconds)
+ * @param next_burst predicted kernel burst (milliseconds)
  * @return received time quota (milliseconds)
  */
-double get_token_from_scheduler(double pred_full_burst) {
+double get_token_from_scheduler(double next_burst) {
   char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   size_t rpos = 0;
   int rc;
   double new_quota;
 
   bzero(sbuf, REQ_MSG_LEN);
-  prepare_request(sbuf, REQ_QUOTA, overuse, pred_full_burst);
+  prepare_request(sbuf, REQ_QUOTA, overuse, next_burst);
 
   // retrieve token from scheduler
   rc = communicate(sbuf, rbuf, 0);
@@ -448,15 +447,18 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
                                 unsigned int blockDimY, unsigned int blockDimZ,
                                 unsigned int sharedMemBytes, CUstream hStream, void **kernelParams,
                                 void **extra) {
-  double new_quota, pred_full_burst;
+  double new_quota, next_burst;
 
   window_predictor.record_stop();
 
-  // check if token expired
   pthread_mutex_lock(&expiration_status_mutex);
-  if (us_since(request_start) / 1e3 + burst_predictor.predict_remain() >= quota_time) {
-    pred_full_burst =
-        estimate_full_burst(burst_predictor.predict_ctxfree(), window_predictor.predict_ctxfree());
+  // allow the kernel to launch if kernel burst already begins;
+  // otherwise, obtain a new token if this kernel burst may cause overuse
+  if (!burst_predictor.ongoing_unmerged() &&
+      us_since(request_start) / 1e3 + burst_predictor.predict_unmerged() >= quota_time) {
+    // estimate the duration of next kernel burst (merged)
+    next_burst =
+        estimate_full_burst(burst_predictor.predict_merged(), window_predictor.predict_merged());
 
     // wait for all kernels finish
     pthread_mutex_lock(&overuse_trk_mutex);
@@ -470,7 +472,7 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
     // interrupt the window which is started when overuse tracking completes
     window_predictor.interrupt();
 
-    new_quota = get_token_from_scheduler(pred_full_burst);
+    new_quota = get_token_from_scheduler(next_burst);
 
     // ensure predicted kernel burst is always less than quota
     burst_predictor.set_upperbound(new_quota - 1.0);
