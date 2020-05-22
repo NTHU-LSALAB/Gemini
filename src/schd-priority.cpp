@@ -16,7 +16,7 @@
 
 #include "scheduler.h"
 
-bool schd_priority(const valid_candidate_t &a, const valid_candidate_t &b) {
+bool schd_priority(const ValidCandidate &a, const ValidCandidate &b) {
   if (a.missing > 0 && b.missing > 0)
     return a.missing / (a.missing + a.usage) > b.missing / (b.missing + b.usage);
   if (a.missing > 0 && b.missing < 0) return true;

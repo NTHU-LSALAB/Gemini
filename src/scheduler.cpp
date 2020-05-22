@@ -18,7 +18,7 @@
  * This is a per-GPU manager/scheduler.
  * Based on the information provided by clients, it decide which client to run
  * and give token to that client. This scheduler act as a daemon, accepting
- * connection and requests from pod manager or hook library directly.
+ * requests from hook library (frontend).
  */
 
 #include "scheduler.h"
@@ -54,16 +54,20 @@
 #include <typeinfo>
 #include <vector>
 
+#if __cplusplus >= 201703L
+#include <filesystem>
+#endif
+
+#include "comm/endpoint.hpp"
 #include "debug.h"
 #include "util.h"
-#ifdef RANDOM_QUOTA
-#include <random>
-#endif
 
 using std::string;
 using std::chrono::duration_cast;
 using std::chrono::microseconds;
+using std::chrono::milliseconds;
 using std::chrono::steady_clock;
+using std::chrono::time_point;
 
 // signal handler
 void sig_handler(int);
@@ -91,11 +95,17 @@ double MIN_QUOTA = 100.0;
 double WINDOW_SIZE = 10000.0;
 int verbosity = 0;
 
-#define EVENT_SIZE sizeof(struct inotify_event)
-#define BUF_LEN (1024 * (EVENT_SIZE + 16))
 auto PROGRESS_START = steady_clock::now();
 char limit_file_name[PATH_MAX] = "resource-config.txt";
 char limit_file_dir[PATH_MAX] = ".";
+
+void *zeromq_context;  // global zeromq context
+// map client name to pointer of ClientGroup
+std::map<string, ClientGroup *> client_group_map;
+
+std::list<Candidate> candidates;
+pthread_mutex_t candidate_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t candidate_cond;  // initialized with CLOCK_MONOTONIC in main()
 
 std::list<History> history_list;
 #ifdef _DEBUG
@@ -107,22 +117,35 @@ inline double ms_since_start() {
   return duration_cast<microseconds>(steady_clock::now() - PROGRESS_START).count() / 1e3;
 }
 
-ClientInfo::ClientInfo(double baseq, double minq, double maxq, double minf, double maxf)
-    : BASE_QUOTA(baseq), MIN_QUOTA(minq), MAX_QUOTA(maxq), MIN_FRAC(minf), MAX_FRAC(maxf) {
-  quota_ = BASE_QUOTA;
+ClientGroup::ClientGroup(std::string name, double baseq, double minq)
+    : kName(name), kBaseQuota(baseq), kMinQuota(minq) {
+  quota_ = baseq;
   latest_overuse_ = 0.0;
   latest_actual_usage_ = 0.0;
   burst_ = 0.0;
+  sem_init(&token_sem_, 0, 0);  // set initial value to 0
 };
 
-ClientInfo::~ClientInfo(){};
+ClientGroup::~ClientGroup() { sem_destroy(&token_sem_); };
 
-void ClientInfo::set_burst(double estimated_burst) { burst_ = estimated_burst; }
+const string &ClientGroup::getName() { return kName; }
 
-void ClientInfo::update_return_time(double overuse) {
+void ClientGroup::updateConstraint(double minf, double maxf, double maxq, size_t mem_limit) {
+  min_frac_ = minf;
+  max_frac_ = maxf;
+  max_quota_ = maxq;
+  mem_limit_ = mem_limit;
+}
+
+/**
+ * Update the end time of client's usage according to the overuse information provided when client
+ * sends another token request, and also the timing when token request is received.
+ * @param overuse overuse information provided in token request
+ */
+void ClientGroup::updateReturnTime(double overuse) {
   double now = ms_since_start();
   for (auto it = history_list.rbegin(); it != history_list.rend(); it++) {
-    if (it->name == this->name) {
+    if (it->name == kName) {
       // client may not use up all of the allocated time
       it->end = std::min(now, it->end + overuse);
       latest_actual_usage_ = it->end - it->start;
@@ -132,17 +155,19 @@ void ClientInfo::update_return_time(double overuse) {
   latest_overuse_ = overuse;
 #ifdef _DEBUG
   for (auto it = full_history.rbegin(); it != full_history.rend(); it++) {
-    if (it->name == this->name) {
+    if (it->name == kName) {
       it->end = std::min(now, it->end + overuse);
       break;
     }
   }
 #endif
 }
+void ClientGroup::setBurst(double estimated_burst) { burst_ = estimated_burst; }
 
-void ClientInfo::Record(double quota) {
+// add quota allocation information into history
+void ClientGroup::record(double quota) {
   History hist;
-  hist.name = this->name;
+  hist.name = kName;
   hist.start = ms_since_start();
   hist.end = hist.start + quota;
   history_list.push_back(hist);
@@ -151,43 +176,51 @@ void ClientInfo::Record(double quota) {
 #endif
 }
 
-double ClientInfo::get_min_fraction() { return MIN_FRAC; }
+size_t ClientGroup::memLimit() { return mem_limit_; }
 
-double ClientInfo::get_max_fraction() { return MAX_FRAC; }
+double ClientGroup::minFrac() { return min_frac_; }
 
-// self-adaptive quota algorithm
-double ClientInfo::get_quota() {
+double ClientGroup::maxFrac() { return max_frac_; }
+
+void ClientGroup::updateQuota() {
   const double UPDATE_RATE = 0.5;  // how drastically will the quota changes
 
   if (burst_ < 1e-9) {
-    // special case when no burst data available, just fallback to static quota
-    quota_ = BASE_QUOTA;
-    DEBUG("%s: fallback to static quota, assign quota: %.3fms", name.c_str(), quota_);
+    // special case when no burst data available (probably no host-synchronous API or kernel burst
+    // is too long to be captured in a token period), just fallback to static quota
+    quota_ = kBaseQuota;
+    DEBUG("%s: fallback to static quota, assign quota: %.3fms", kName.c_str(), quota_);
   } else {
     quota_ = burst_ * UPDATE_RATE + quota_ * (1 - UPDATE_RATE);
-    quota_ = std::max(quota_, MIN_QUOTA);  // lowerbound
-    quota_ = std::min(quota_, MAX_QUOTA);  // upperbound
-    DEBUG("%s: burst: %.3fms, assign quota: %.3fms", name.c_str(), burst_, quota_);
+    quota_ = std::max(quota_, kMinQuota);   // lowerbound
+    quota_ = std::min(quota_, max_quota_);  // upperbound
+    DEBUG("%s: burst: %.3fms, assign quota: %.3fms", kName.c_str(), burst_, quota_);
   }
-  return quota_;
 }
 
-// map container name to object
-std::map<string, ClientInfo *> client_info_map;
+double ClientGroup::getQuota() { return quota_; }
 
-std::list<candidate_t> candidates;
-pthread_mutex_t candidate_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t candidate_cond;  // initialized with CLOCK_MONOTONIC in main()
+// wait until semaphore becomes positive
+void ClientGroup::waitToken() { sem_wait(&token_sem_); }
 
-void read_resource_config() {
+// notify waiting thread
+void ClientGroup::giveToken() { sem_post(&token_sem_); }
+
+/**
+ * Read resource constraint config file and update client group constraints.
+ * If new client group is found, create corresponding ClientGroup and add to client_group_map.
+ * @return a vector contains pointers to newly created ClientGroup entries.
+ */
+vector<ClientGroup *> read_resource_config() {
   std::fstream fin;
-  ClientInfo *client_inf;
+  ClientGroup *group;
   char client_name[HOST_NAME_MAX], full_path[PATH_MAX];
-  size_t gpu_memory_size;
-  double gpu_min_fraction, gpu_max_fraction;
-  int container_num;
+  size_t mem_limit;
+  double min_frac, max_frac;
+  int client_num;
+  vector<ClientGroup *> new_client_groups;
 
-  bzero(full_path, PATH_MAX);
+  memset(full_path, 0, PATH_MAX);
   strncpy(full_path, limit_file_dir, PATH_MAX);
   if (limit_file_dir[strlen(limit_file_dir) - 1] != '/') full_path[strlen(limit_file_dir)] = '/';
   strncat(full_path, limit_file_name, PATH_MAX - strlen(full_path));
@@ -198,78 +231,38 @@ void read_resource_config() {
     ERROR("failed to open file %s: %s", full_path, strerror(errno));
     exit(1);
   }
-  fin >> container_num;
-  INFO("There are %d clients in the system...", container_num);
-  for (int i = 0; i < container_num; i++) {
-    fin >> client_name >> gpu_min_fraction >> gpu_max_fraction >> gpu_memory_size;
-    client_inf = new ClientInfo(QUOTA, MIN_QUOTA, gpu_max_fraction * WINDOW_SIZE, gpu_min_fraction,
-                                gpu_max_fraction);
-    client_inf->name = client_name;
-    client_inf->gpu_mem_limit = gpu_memory_size;
-    if (client_info_map.find(client_name) != client_info_map.end())
-      delete client_info_map[client_name];
-    client_info_map[client_name] = client_inf;
-    INFO("%s request: %.2f, limit: %.2f, memory limit: %lu bytes", client_name, gpu_min_fraction,
-         gpu_max_fraction, gpu_memory_size);
+  fin >> client_num;
+  INFO("There are %d clients in the system...", client_num);
+  for (int i = 0; i < client_num; i++) {
+    fin >> client_name >> min_frac >> max_frac >> mem_limit;
+
+    // use existing group information (if exist)
+    if (client_group_map.find(client_name) != client_group_map.end()) {
+      group = client_group_map[client_name];
+    } else {
+      group = new ClientGroup(client_name, QUOTA, MIN_QUOTA);
+      client_group_map[client_name] = group;
+      new_client_groups.push_back(group);
+    }
+
+    group->updateConstraint(min_frac, max_frac, max_frac * WINDOW_SIZE, mem_limit);
+
+    INFO("%s request: %.2f, limit: %.2f, memory limit: %lu bytes", client_name, min_frac, max_frac,
+         mem_limit);
   }
   fin.close();
-}
 
-void monitor_file(const char *path, const char *filename) {
-  INFO("Monitor thread created.");
-  int fd, wd;
-
-  // Initialize Inotify
-  fd = inotify_init();
-  if (fd < 0) ERROR("Failed to initialize inotify");
-
-  // add watch to starting directory
-  wd = inotify_add_watch(fd, path, IN_CLOSE_WRITE);
-
-  if (wd == -1)
-    ERROR("Failed to add watch to '%s'.", path);
-  else
-    INFO("Watching '%s'.", path);
-
-  // start watching
-  while (1) {
-    int i = 0;
-    char buffer[BUF_LEN];
-    int length = read(fd, buffer, BUF_LEN);
-    if (length < 0) ERROR("Read error");
-
-    while (i < length) {
-      struct inotify_event *event = (struct inotify_event *)&buffer[i];
-
-      if (event->len) {
-        if (event->mask & IN_CLOSE_WRITE) {
-          INFO("File %s modified with watch descriptor %d.", (const char *)event->name, event->wd);
-          // if event is triggered by target file
-          if (strcmp((const char *)event->name, filename) == 0) {
-            INFO("Update containers' settings...");
-            read_resource_config();
-          }
-        }
-      }
-      // update index to start of next event
-      i += EVENT_SIZE + event->len;
-    }
-  }
-
-  // Clean up
-  // Supposed to be unreached.
-  inotify_rm_watch(fd, wd);
-  close(fd);
+  return new_client_groups;
 }
 
 /**
- * Select a candidate whose current usage is less than its limit.
- * If no such candidates, calculate the time until time window content changes and sleep until then,
- * or until another candidate comes. If more than one candidate meets the requirement, select one
- * according to scheduling policy.
+ * Select a candidate whose current usage is less than its limit, and erase it from waiting
+ * candidates. If no such candidate exists, calculate the time until time window content changes and
+ * sleep until then, or until another candidate comes. If multiple candidates meet the requirement,
+ * select one according to scheduling policy.
  * @return selected candidate
  */
-candidate_t select_candidate() {
+Candidate select_candidate() {
   while (true) {
     /* update history list and get usage in a time interval */
     double window_size = WINDOW_SIZE;
@@ -309,11 +302,11 @@ candidate_t select_candidate() {
 
     // quick exit if the first one in candidates does not use GPU recently
     auto check_appearance = [=](const History &h) -> bool {
-      return h.name == candidates.front().name;
+      return h.name == candidates.front().group_ptr->getName();
     };
     if (std::find_if(history_list.begin(), history_list.end(), check_appearance) ==
         history_list.end()) {
-      candidate_t selected = candidates.front();
+      Candidate selected = candidates.front();
       candidates.pop_front();
       return selected;
     }
@@ -365,17 +358,17 @@ candidate_t select_candidate() {
     }
 
     /* select the one to execute */
-    std::vector<valid_candidate_t> vaild_candidates;
+    std::vector<ValidCandidate> vaild_candidates;
 
     for (auto it = candidates.begin(); it != candidates.end(); it++) {
-      string name = it->name;
+      string name = it->group_ptr->getName();
       double limit, require, missing, remaining;
-      limit = client_info_map[name]->get_max_fraction() * window_size;
-      require = client_info_map[name]->get_min_fraction() * window_size;
+      limit = it->group_ptr->maxFrac() * window_size;
+      require = it->group_ptr->minFrac() * window_size;
       missing = require - usage[name];
       remaining = limit - usage[name];
       if (remaining > 0)
-        vaild_candidates.push_back({missing, remaining, usage[it->name], it->arrived_time, it});
+        vaild_candidates.push_back({missing, remaining, usage[name], it->arrived_time, it});
     }
 
     if (vaild_candidates.size() == 0) {
@@ -390,85 +383,42 @@ candidate_t select_candidate() {
     std::sort(vaild_candidates.begin(), vaild_candidates.end(), schd_priority);
 
     auto selected_iter = vaild_candidates.begin()->iter;
-    candidate_t result = *selected_iter;
+    Candidate result = *selected_iter;
     candidates.erase(selected_iter);
     return result;
   }
 }
 
-// Get the information from message
-void handle_message(int client_sock, char *message) {
-  reqid_t req_id;  // simply pass this req_id back to Pod manager
-  comm_request_t req;
-  size_t hostname_len, offset = 0;
-  char sbuf[RSP_MSG_LEN];
-  char *attached, *client_name;
-  ClientInfo *client_inf;
-  attached = parse_request(message, &client_name, &hostname_len, &req_id, &req);
-
-  if (client_info_map.find(string(client_name)) == client_info_map.end()) {
-    WARNING("Unknown client \"%s\". Ignore this request.", client_name);
-    return;
-  }
-  client_inf = client_info_map[string(client_name)];
-  bzero(sbuf, RSP_MSG_LEN);
-
-  if (req == REQ_QUOTA) {
-    double overuse, burst, window;
-    overuse = get_msg_data<double>(attached, offset);
-    burst = get_msg_data<double>(attached, offset);
-
-    client_inf->update_return_time(overuse);
-    client_inf->set_burst(burst);
-    pthread_mutex_lock(&candidate_mutex);
-    candidates.push_back({client_sock, string(client_name), req_id, ms_since_start()});
-    pthread_cond_signal(&candidate_cond);  // wake schedule_daemon_func up
-    pthread_mutex_unlock(&candidate_mutex);
-    // select_candidate() will give quota later
-
-  } else if (req == REQ_MEM_LIMIT) {
-    prepare_response(sbuf, REQ_MEM_LIMIT, req_id, (size_t)0, client_inf->gpu_mem_limit);
-    send(client_sock, sbuf, RSP_MSG_LEN, 0);
-  } else if (req == REQ_MEM_UPDATE) {
-    // ***for communication interface compatibility only***
-    // memory usage is only tracked on hook library side
-    WARNING("scheduler always returns true for memory usage update!");
-    prepare_response(sbuf, REQ_MEM_UPDATE, req_id, 1);
-    send(client_sock, sbuf, RSP_MSG_LEN, 0);
-  } else {
-    WARNING("\"%s\" send an unknown request.", client_name);
-  }
-}
-
+/**
+ * Main function of scheduling thread.
+ * In each iteration select one valid (under usage constraint) client group, remove it from waiting
+ * queue, and sleep until it returns or given quota expires. In case no valid candidates, it
+ * calculates the time when client groups usage changes and sleeps until then (in select_candidate).
+ * Scheduling thread also wakes up when new client group comes for token.
+ */
 void *schedule_daemon_func(void *) {
-#ifdef RANDOM_QUOTA
-  std::random_device rd;
-  std::default_random_engine gen(rd());
-  std::uniform_real_distribution<double> dis(0.4, 1.0);
-#endif
   double quota;
 
   while (1) {
     pthread_mutex_lock(&candidate_mutex);
     if (candidates.size() != 0) {
+      string selected_name;
       // remove an entry from candidates
-      candidate_t selected = select_candidate();
-      DEBUG("select %s, waiting time: %.3f ms", selected.name.c_str(),
-            ms_since_start() - selected.arrived_time);
-
-      quota = client_info_map[selected.name]->get_quota();
-#ifdef RANDOM_QUOTA
-      quota *= dis(gen);
-#endif
-      client_info_map[selected.name]->Record(quota);
-
+      Candidate selected = select_candidate();
       pthread_mutex_unlock(&candidate_mutex);
 
-      // send quota to selected instance
-      char sbuf[RSP_MSG_LEN];
-      bzero(sbuf, RSP_MSG_LEN);
-      prepare_response(sbuf, REQ_QUOTA, selected.req_id, quota);
-      send(selected.socket, sbuf, RSP_MSG_LEN, 0);
+      selected_name = selected.group_ptr->getName();
+
+      DEBUG("select %s, waiting time: %.3f ms", selected_name.c_str(),
+            ms_since_start() - selected.arrived_time);
+
+      selected.group_ptr->updateQuota();
+      quota = selected.group_ptr->getQuota();
+      selected.group_ptr->record(quota);
+
+      // wake the waiting thread up
+      // group management thread will send token to client group
+      selected.group_ptr->giveToken();
 
       struct timespec ts = get_timespec_after(quota);
 
@@ -478,12 +428,12 @@ void *schedule_daemon_func(void *) {
       while (should_wait) {
         int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
         if (rc == ETIMEDOUT) {
-          DEBUG("%s didn't return on time", selected.name.c_str());
+          DEBUG("%s didn't return on time", selected_name.c_str());
           should_wait = false;
         } else {
           // check if the selected one comes back
           for (auto conn : candidates) {
-            if (conn.name == selected.name) {
+            if (conn.group_ptr->getName() == selected_name) {
               should_wait = false;
               break;
             }
@@ -492,7 +442,7 @@ void *schedule_daemon_func(void *) {
       }
       pthread_mutex_unlock(&candidate_mutex);
     } else {
-      // wait for incoming connections
+      // wait for new client group comes
       DEBUG("no candidates");
       pthread_cond_wait(&candidate_cond, &candidate_mutex);
       pthread_mutex_unlock(&candidate_mutex);
@@ -500,19 +450,202 @@ void *schedule_daemon_func(void *) {
   }
 }
 
-// daemon function for Pod manager: waiting for incoming request
-void *pod_client_func(void *args) {
-  int pod_sockfd = *((int *)args);
-  char *rbuf = new char[REQ_MSG_LEN];
-  ssize_t recv_rc;
-  while ((recv_rc = recv(pod_sockfd, rbuf, REQ_MSG_LEN, 0)) > 0) {
-    handle_message(pod_sockfd, rbuf);
+// store allocated memory size and last heartbeat record
+using MemoryUsageRecord = pair<size_t, time_point<steady_clock>>;
+
+/**
+ * Remove peers which are considered dead (heartbeat timeout).
+ * @param peers_status a std::map contains MemoryUsageRecord of peers
+ * @return reclaimed bytes
+ */
+size_t removeDeadPeers(std::map<string, MemoryUsageRecord> &peers_status) {
+  const int64_t kHeartbeatTimeoutSec = 10;
+  size_t reclaimed_bytes = 0;
+
+  time_point<steady_clock> current_time = steady_clock::now();
+  vector<string> dead_peers;
+  for (auto peer : peers_status) {
+    if (duration_cast<std::chrono::seconds>(current_time - peer.second.second).count() >
+        kHeartbeatTimeoutSec) {
+      dead_peers.push_back(peer.first);
+    }
   }
-  DEBUG("Connection closed by Pod manager. recv() returns %ld.", recv_rc);
-  close(pod_sockfd);
-  delete (int *)args;
-  delete[] rbuf;
-  pthread_exit(NULL);
+  for (auto peer : dead_peers) {
+    WARNING("Client %s is considered dead, reclaiming %lu bytes", peer.c_str(),
+            peers_status[peer].first);
+    reclaimed_bytes += peers_status[peer].first;
+    peers_status.erase(peer);
+  }
+  return reclaimed_bytes;
+}
+
+/**
+ * Main function of a client group management thread.
+ * A client group management thread receives request from clients via zeromq socket, and respond to
+ * client with client group statistics. When needed (e.g. token expired), it also forward the
+ * request to main scheduler thread and wait for response in a "blocking" state.
+ * @param args pointer to a ClientGroup instance
+ */
+void *clientGroupMgmt(void *args) {
+  ClientGroup *group = static_cast<ClientGroup *>(args);
+  char url[PATH_MAX];
+  snprintf(url, PATH_MAX, "ipc:///tmp/gemini/client/%s", group->getName().c_str());
+
+#if __cplusplus >= 201703L
+  // create directory recursively
+  // std::filesystem::path ipc_file_path(url);
+  // std::filesystem::create_directories(ipc_file_path.remove_filename());
+  std::filesystem::create_directories("/tmp/gemini/client");
+#endif
+  Responder responder(zeromq_context, url);
+
+  // allocated memory size and last heartbeat record of each client (peer)
+  size_t total_used_memory = 0UL;
+  std::map<string, MemoryUsageRecord> peers_status;
+  time_point<steady_clock> token_expire = steady_clock::now();
+
+  while (true) {
+    Request req;
+    Response *rsp = nullptr;
+    responder.getRequest(&req);
+
+    // add fields in peers_status for requests from new client (peer)
+    if (peers_status.find(req.from()) == peers_status.end()) {
+      peers_status[req.from()] = {0, time_point<steady_clock>::min()};
+    }
+    // update heartbeat record
+    peers_status[req.from()].second = steady_clock::now();
+
+    if (req.what() == kHeartbeat) {
+      // nothing to do, just reply
+      rsp = new HeartbeatResponse();
+    } else if (req.what() == kMemInfo) {
+      // refresh memory usage
+      total_used_memory -= removeDeadPeers(peers_status);
+      rsp = new MemInfoResponse(total_used_memory, group->memLimit());
+    } else if (req.what() == kMemAlloc) {
+      // refresh memory usage
+      total_used_memory -= removeDeadPeers(peers_status);
+
+      MemAllocRequest mem_alloc_req(req);
+      // check memory limit
+      if (mem_alloc_req.isIncrease()) {
+        if (total_used_memory + mem_alloc_req.deltaSize() <= group->memLimit()) {
+          total_used_memory += mem_alloc_req.deltaSize();
+          peers_status[req.from()].first += mem_alloc_req.deltaSize();
+          rsp = new MemAllocResponse(true);
+        } else {
+          rsp = new MemAllocResponse(false);
+        }
+      } else {
+        total_used_memory -= std::min(mem_alloc_req.deltaSize(), total_used_memory);
+        peers_status[req.from()].first -=
+            std::min(mem_alloc_req.deltaSize(), peers_status[req.from()].first);
+        rsp = new MemAllocResponse(true);
+      }
+    } else if (req.what() == kToken) {
+      TokenRequest token_req(req);
+      double remain = duration_cast<milliseconds>(token_expire - steady_clock::now()).count();
+      if (remain < token_req.nextBurst()) {
+        // remaining time is not enough
+        group->updateReturnTime(token_req.overuse());
+        group->setBurst(token_req.nextBurst());
+
+        // push group into waiting queue
+        pthread_mutex_lock(&candidate_mutex);
+        candidates.push_back({group, ms_since_start()});
+        pthread_cond_signal(&candidate_cond);
+        pthread_mutex_unlock(&candidate_mutex);
+
+        // block and wait for response
+        // if waitToken returns immediately, it means that scheduling daemon already gives out token
+        group->waitToken();
+
+        remain = group->getQuota();
+        token_expire = steady_clock::now() + milliseconds(static_cast<int64_t>(remain));
+      }
+      rsp = new TokenResponse(remain);
+    } else {
+      ERROR("Client group %s received an unknown request from client %s", group->getName().c_str(),
+            req.from().c_str());
+      rsp = new Response();
+    }
+
+    responder.sendResponse(*rsp);
+    delete rsp;
+    rsp = nullptr;
+  }
+
+  pthread_exit(nullptr);
+}
+
+// Create client group management threads in detached state.
+void spawnClientGroupThreads(const vector<ClientGroup *> groups) {
+  for (ClientGroup *group : groups) {
+    pthread_t tid;
+    int rc = pthread_create(&tid, nullptr, clientGroupMgmt, group);
+    if (rc != 0) {
+      ERROR("Failed to create client group management thread: %s", strerror(rc));
+      exit(rc);
+    }
+    pthread_detach(tid);
+  }
+}
+
+// Monitor the change to resource config file, and spawn new client group management threads if
+// needed.
+void monitorConfigFile(const char *path, const char *filename) {
+  const size_t kEventSize = sizeof(struct inotify_event);
+  const size_t kBufLen = 1024 * (kEventSize + 16);
+  int fd, wd;
+
+  // Initialize Inotify
+  fd = inotify_init();
+  if (fd < 0) {
+    ERROR("Failed to initialize inotify");
+    return;
+  }
+
+  // add watch to starting directory
+  wd = inotify_add_watch(fd, path, IN_CLOSE_WRITE);
+
+  if (wd == -1) {
+    ERROR("Failed to add watch to '%s'.", path);
+    return;
+  } else {
+    INFO("Watching '%s'.", path);
+  }
+
+  // start watching
+  while (true) {
+    int i = 0;
+    char buffer[kBufLen];
+    int length = read(fd, buffer, kBufLen);
+    if (length < 0) ERROR("Read error");
+
+    while (i < length) {
+      struct inotify_event *event = (struct inotify_event *)&buffer[i];
+
+      if (event->len) {
+        if (event->mask & IN_CLOSE_WRITE) {
+          INFO("File %s modified with watch descriptor %d.", (const char *)event->name, event->wd);
+          // if event is triggered by target file
+          if (strcmp((const char *)event->name, filename) == 0) {
+            INFO("Update resource configurations...");
+            vector<ClientGroup *> new_client_groups = read_resource_config();
+            spawnClientGroupThreads(new_client_groups);
+          }
+        }
+      }
+      // update index to start of next event
+      i += kEventSize + event->len;
+    }
+  }
+
+  // Clean up
+  // Supposed to be unreached.
+  inotify_rm_watch(fd, wd);
+  close(fd);
 }
 
 int main(int argc, char *argv[]) {
@@ -582,38 +715,10 @@ int main(int argc, char *argv[]) {
   if (verbosity > 0) signal(SIGINT, dump_history);
 #endif
 
+  zeromq_context = zmq_ctx_new();
+
   // read configuration file
-  read_resource_config();
-
-  int rc;
-  int sockfd = 0;
-  int forClientSockfd = 0;
-  struct sockaddr_in clientInfo;
-  int addrlen = sizeof(clientInfo);
-
-  // create a monitored thread
-  std::thread t1(monitor_file, std::ref(limit_file_dir), std::ref(limit_file_name));
-  t1.detach();
-
-  sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sockfd == -1) {
-    ERROR("Fail to create a socket!");
-    exit(-1);
-  }
-
-  struct sockaddr_in serverInfo;
-  bzero(&serverInfo, sizeof(serverInfo));
-
-  serverInfo.sin_family = PF_INET;
-  serverInfo.sin_addr.s_addr = INADDR_ANY;
-  serverInfo.sin_port = htons(schd_port);
-  if (bind(sockfd, (struct sockaddr *)&serverInfo, sizeof(serverInfo)) < 0) {
-    ERROR("cannot bind port");
-    exit(-1);
-  }
-  listen(sockfd, SOMAXCONN);
-
-  pthread_t tid;
+  vector<ClientGroup *> groups = read_resource_config();
 
   // initialize candidate_cond with CLOCK_MONOTONIC
   pthread_condattr_t attr_monotonic_clock;
@@ -621,28 +726,21 @@ int main(int argc, char *argv[]) {
   pthread_condattr_setclock(&attr_monotonic_clock, CLOCK_MONOTONIC);
   pthread_cond_init(&candidate_cond, &attr_monotonic_clock);
 
-  rc = pthread_create(&tid, NULL, schedule_daemon_func, NULL);
+  pthread_t tid;
+  int rc = pthread_create(&tid, NULL, schedule_daemon_func, NULL);
   if (rc != 0) {
     ERROR("Return code from pthread_create(): %d", rc);
     exit(rc);
   }
   pthread_detach(tid);
-  INFO("Waiting for incoming connection");
 
-  while (
-      (forClientSockfd = accept(sockfd, (struct sockaddr *)&clientInfo, (socklen_t *)&addrlen))) {
-    INFO("Received an incoming connection.");
-    pthread_t tid;
-    int *pod_sockfd = new int;
-    *pod_sockfd = forClientSockfd;
-    // create a thread to service this Pod manager
-    pthread_create(&tid, NULL, pod_client_func, pod_sockfd);
-    pthread_detach(tid);
-  }
-  if (forClientSockfd < 0) {
-    ERROR("Accept failed");
-    return 1;
-  }
+  spawnClientGroupThreads(groups);
+
+  // Main thread complete creating initial child threads.
+  // The remaining job is to watch for newcomers (new ClientGroup).
+  monitorConfigFile(limit_file_dir, limit_file_name);
+
+  zmq_ctx_term(zeromq_context);
   return 0;
 }
 

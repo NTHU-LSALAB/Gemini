@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -49,7 +50,7 @@
 #include <random>
 #include <sstream>
 
-#include "comm.h"
+#include "comm/endpoint.hpp"
 #include "debug.h"
 #include "predictor.h"
 #include "util.h"
@@ -144,12 +145,13 @@ void *dlsym(void *handle, const char *symbol) {
   return (real_dlsym(handle, symbol));
 }
 
-/* connection with Pod manager */
-char pod_manager_ip[20] = "127.0.0.1";
-uint16_t pod_manager_port = 50052;                       // default value
+/* connection with backend */
+char group_name[HOST_NAME_MAX];
+char client_random_id[9];  // hex string of a 32-bit random number
+char backend_ip[20] = "127.0.0.1";
+uint16_t backend_port = 50052;                           // default value
 pthread_mutex_t comm_mutex = PTHREAD_MUTEX_INITIALIZER;  // one communication at a time
-const int NET_OP_MAX_ATTEMPT = 5;  // maximum time retrying failed network operations
-const int NET_OP_RETRY_INTV = 10;  // seconds between two retries
+Requester *requester;
 
 /* GPU computation resource usage */
 double quota_time = 0;  // time quota from scheduler
@@ -193,76 +195,24 @@ long long us_since(struct timespec begin) {
  * get connection information from environment variables
  */
 void configure_connection() {
-  // get Pod manager IP, default 127.0.0.1
-  char *ip = getenv("POD_MANAGER_IP");
-  if (ip != NULL) strcpy(pod_manager_ip, ip);
+  // get backend IP, default 127.0.0.1
+  char *ip = getenv("GEMINI_BACKEND_IP");
+  if (ip != NULL) strcpy(backend_ip, ip);
 
-  // get Pod manager port, default 50052
-  char *port = getenv("POD_MANAGER_PORT");
-  if (port != NULL) pod_manager_port = atoi(port);
+  // get backend port, default 50052
+  char *port = getenv("GEMINI_BACKEND_PORT");
+  if (port != NULL) backend_port = atoi(port);
 
-  DEBUG("Pod manager: %s:%u", pod_manager_ip, pod_manager_port);
-}
-
-/**
- * establish connection with scheduler.
- * @return connected socket file descriptor
- */
-int establish_connection() {
-  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sockfd == -1) {
-    ERROR("Failed to create socket.");
-    exit(-1);
+  char *name = getenv("GEMINI_GROUP_NAME");
+  if (name != NULL) {
+    strcpy(group_name, name);
+  } else {
+    gethostname(group_name, HOST_NAME_MAX);
   }
 
-  struct sockaddr_in info;
-  bzero(&info, sizeof(info));
-  info.sin_family = PF_INET;
-  info.sin_addr.s_addr = inet_addr(pod_manager_ip);
-  info.sin_port = htons(pod_manager_port);
-
-  int rc = multiple_attempt(
-      [&]() -> int { return connect(sockfd, (struct sockaddr *)&info, sizeof(info)); },
-      NET_OP_MAX_ATTEMPT, NET_OP_RETRY_INTV);
-  if (rc != 0) {
-    ERROR("Connection error: %s", strerror(rc));
-    exit(rc);
-  }
-
-  return sockfd;
-}
-
-/**
- * Unified communication method with Pod manager/scheduler.
- * Send a request and receive a response.
- * Only one thread can communicate at the same time.
- * @param sbuf buffer with the data to send.
- * @param rbuf buffer which will be filled with received data.
- * @param socket_timeout socket timeout (second), 0 means never timeout
- * @return buffer with received data
- */
-int communicate(char *sbuf, char *rbuf, int socket_timeout) {
-  static int sockfd = establish_connection();
-  int rc;
-  struct timeval tv;
-
-  pthread_mutex_lock(&comm_mutex);
-
-  // set socket timeout
-  tv = {socket_timeout, 0};
-  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-  // perform communication
-  rc = multiple_attempt(
-      [&]() -> int {
-        if (send(sockfd, sbuf, REQ_MSG_LEN, 0) == -1) return -1;
-        if (recv(sockfd, rbuf, RSP_MSG_LEN, 0) == -1) return -1;
-        return 0;
-      },
-      NET_OP_MAX_ATTEMPT);
-
-  pthread_mutex_unlock(&comm_mutex);
-  return rc;
+  char url[PATH_MAX];
+  snprintf(url, PATH_MAX, "ipc:///tmp/gemini/client/%s", group_name);
+  requester = new Requester(nullptr, url);
 }
 
 /**
@@ -278,57 +228,28 @@ void host_sync_call(const char *func_name) {
 }
 
 /**
- * get available GPU memory from Pod manager/scheduler
- * assume user memory limit won't exceed hardware limit
+ * get available GPU memory from backend.
+ * assume configured memory limit won't exceed hardware limit
  * @return remaining memory, memory limit
  */
 std::pair<size_t, size_t> get_gpu_memory_info() {
-  char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
-  size_t rpos = 0;
-  int rc;
-  size_t used, total;
-
-  bzero(sbuf, REQ_MSG_LEN);
-  prepare_request(sbuf, REQ_MEM_LIMIT);
-
-  // get data from Pod manager
-  rc = communicate(sbuf, rbuf, NET_OP_RETRY_INTV);
-  if (rc != 0) {
-    ERROR("failed to get GPU memory information: %s", strerror(rc));
-    exit(rc);
-  }
-  attached = parse_response(rbuf, nullptr);
-  used = get_msg_data<size_t>(attached, rpos);
-  total = get_msg_data<size_t>(attached, rpos);
-
-  return std::make_pair(total - used, total);
+  MemInfoRequest request(client_random_id);
+  MemInfoResponse response;
+  requester->submit(request, &response);
+  return std::make_pair(response.total() - response.used(), response.total());
 }
 
 /**
- * send memory allocate/free information to Pod manager/scheduler
+ * send memory allocate/free information to backend
  * @param bytes memory size
- * @param is_allocate 1 for allocation, 0 for free
- * @return request succeed or not
+ * @param is_allocate
+ * @return operation permitted or not
  */
-int update_memory_usage(size_t bytes, int is_allocate) {
-  char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
-  size_t rpos = 0;
-  int rc;
-  int verdict;
-
-  bzero(sbuf, REQ_MSG_LEN);
-  prepare_request(sbuf, REQ_MEM_UPDATE, bytes, is_allocate);
-
-  // get verdict from Pod manager
-  rc = communicate(sbuf, rbuf, NET_OP_RETRY_INTV);
-  if (rc != 0) {
-    ERROR("failed to update GPU memory usage: %s", strerror(rc));
-    exit(rc);
-  }
-  attached = parse_response(rbuf, nullptr);
-  verdict = get_msg_data<int>(attached, rpos);
-
-  return verdict;
+int update_memory_usage(size_t bytes, bool is_allocate) {
+  MemAllocRequest request(client_random_id, bytes, is_allocate);
+  MemAllocResponse response;
+  requester->submit(request, &response);
+  return response.permitted();
 }
 
 /**
@@ -357,30 +278,15 @@ double estimate_full_burst(double measured_burst, double measured_window) {
 }
 
 /**
- * send token request to scheduling system
+ * ask token from backend system
  * @param next_burst predicted kernel burst (milliseconds)
  * @return received time quota (milliseconds)
  */
 double get_token_from_scheduler(double next_burst) {
-  char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
-  size_t rpos = 0;
-  int rc;
-  double new_quota;
-
-  bzero(sbuf, REQ_MSG_LEN);
-  prepare_request(sbuf, REQ_QUOTA, overuse, next_burst);
-
-  // retrieve token from scheduler
-  rc = communicate(sbuf, rbuf, 0);
-  if (rc != 0) {
-    ERROR("failed to get token from scheduler: %s", strerror(rc));
-    exit(rc);
-  }
-  attached = parse_response(rbuf, nullptr);
-  new_quota = get_msg_data<double>(attached, rpos);
-
-  DEBUG("Get token from scheduler, quota: %f", new_quota);
-  return new_quota;
+  TokenRequest request(client_random_id, overuse, next_burst);
+  TokenResponse response;
+  requester->submit(request, &response);
+  return response.quota();
 }
 
 /**
@@ -436,6 +342,29 @@ void *wait_cuda_kernels(void *args) {
     pthread_mutex_unlock(&overuse_trk_mutex);
   }
   pthread_exit(NULL);
+}
+
+// A background thread sending & receiving heartbeat message from backend
+void *heartbeatThread(void *) {
+  const int kHeartbeatIntv = 5;
+  while (true) {
+    HeartbeatRequest request(client_random_id);
+    requester->submit(request, nullptr);
+    sleep(kHeartbeatIntv);
+  }
+  pthread_exit(nullptr);
+}
+
+// Free up memory usage of current process accounted in backend when current process terminates
+void releaseMemoryOnTerminate() {
+  MemAllocRequest request(client_random_id, gpu_mem_used, false);
+  MemAllocResponse response;
+  requester->submit(request, &response);
+  if (response.permitted()) {
+    INFO("all accounted GPU memory usage (%lu B) are released in backend", gpu_mem_used);
+  } else {
+    ERROR("failed to release accounted memory usage in backend on process termination");
+  }
 }
 
 /**
@@ -510,7 +439,7 @@ CUresult cuMemFree_prehook(CUdeviceptr ptr) {
     DEBUG("Freeing unknown memory! %zx", ptr);
   } else {
     gpu_mem_used -= allocation_map[ptr];
-    update_memory_usage(allocation_map[ptr], 0);
+    update_memory_usage(allocation_map[ptr], false);
     allocation_map.erase(ptr);
   }
   pthread_mutex_unlock(&allocation_mutex);
@@ -541,7 +470,7 @@ CUresult cuMemAlloc_prehook(CUdeviceptr *dptr, size_t bytesize) {
 // push memory allocation information to backend
 CUresult cuMemAlloc_posthook(CUdeviceptr *dptr, size_t bytesize) {
   // send memory usage update to backend
-  if (!update_memory_usage(bytesize, 1)) {
+  if (!update_memory_usage(bytesize, true)) {
     ERROR("Allocate too much memory!");
     return CUDA_ERROR_OUT_OF_MEMORY;
   }
@@ -660,6 +589,10 @@ CUresult cuMemcpyHtoD_posthook(CUarray dstArray, size_t dstOffset, const void *s
 }
 
 void initialize() {
+  // generate random client identifier
+  srand(getpid() ^ time(nullptr));
+  snprintf(client_random_id, sizeof(client_random_id), "%08x", rand());
+
   // place post-hooks
   hook_inf.postHooks[CU_HOOK_MEMCPY_ATOH] = (void *)cuMemcpyAtoH_posthook;
   hook_inf.postHooks[CU_HOOK_MEMCPY_DTOH] = (void *)cuMemcpyDtoH_posthook;
@@ -688,6 +621,15 @@ void initialize() {
   hook_inf.preHooks[CU_HOOK_MIPMAPPED_ARRAY_CREATE] = (void *)cuMipmappedArrayCreate_prehook;
 
   configure_connection();
+
+  // register memory usage clean-up function
+  atexit(releaseMemoryOnTerminate);
+
+  // launch heartbeat thread
+  pthread_t tid;
+  pthread_create(&tid, nullptr, heartbeatThread, nullptr);
+  pthread_detach(tid);
+
   pthread_mutex_lock(&request_time_mutex);
   cudaEventCreate(&cuevent_start);
 
@@ -708,7 +650,7 @@ void initialize() {
   pthread_mutex_unlock(&request_time_mutex);
 }
 
-CUstream hStream;  // redundent variable used for macro expansion
+// CUstream hStream;  // redundent variable used for macro expansion
 
 #define CU_HOOK_GENERATE_INTERCEPT(hooksymbol, funcname, params, ...)                     \
   CUresult CUDAAPI funcname params {                                                      \
