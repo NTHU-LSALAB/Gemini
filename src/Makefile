@@ -42,7 +42,7 @@ COMM_HEADERS = $(foreach file,$(COMM_FILES),comm/$(file).hpp)
 COMM_OBJS = $(foreach file,$(COMM_FILES),comm/$(file).o)
 
 # Third-party libraries
-EXTLIBS = libzmq
+EXTLIBS = libzmq glib-2.0
 CXXFLAGS += $(foreach ext,$(EXTLIBS),$(shell $(PKGCONFIG) --cflags $(ext)))
 LDFLAGS += $(foreach ext,$(EXTLIBS),$(shell $(PKGCONFIG) --libs $(ext)))
 
@@ -72,9 +72,12 @@ scheduler.o: scheduler.cpp debug.h util.h scheduler.h $(COMM_HEADERS)
 schd-priority.o: schd-priority.cpp scheduler.h
 	$(CXX) $(CXXFLAGS) -o $@ -c $<
 
-gem-schd: scheduler.o schd-priority.o debug.o comm
+parse-config.o: parse-config.cpp parse-config.h
+	$(CXX) $(CXXFLAGS) -o $@ -c $<
+
+gem-schd: scheduler.o schd-priority.o debug.o parse-config.o comm
 	$(CXX) $(LDFLAGS) -pthread -rdynamic -o $@ \
-		scheduler.o schd-priority.o debug.o $(COMM_OBJS)
+		scheduler.o schd-priority.o debug.o parse-config.o $(COMM_OBJS)
 	mkdir -p $(PREFIX)/bin
 	$(INSTALL) -s -m 755 -t $(PREFIX)/bin $@
 

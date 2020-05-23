@@ -60,6 +60,7 @@
 
 #include "comm/endpoint.hpp"
 #include "debug.h"
+#include "parse-config.h"
 #include "util.h"
 
 using std::string;
@@ -96,7 +97,7 @@ double WINDOW_SIZE = 10000.0;
 int verbosity = 0;
 
 auto PROGRESS_START = steady_clock::now();
-char limit_file_name[PATH_MAX] = "resource-config.txt";
+char limit_file_name[PATH_MAX] = "resource.conf";
 char limit_file_dir[PATH_MAX] = ".";
 
 void *zeromq_context;  // global zeromq context
@@ -212,46 +213,39 @@ void ClientGroup::giveToken() { sem_post(&token_sem_); }
  * @return a vector contains pointers to newly created ClientGroup entries.
  */
 vector<ClientGroup *> read_resource_config() {
-  std::fstream fin;
   ClientGroup *group;
-  char client_name[HOST_NAME_MAX], full_path[PATH_MAX];
+  char full_path[PATH_MAX];
   size_t mem_limit;
   double min_frac, max_frac;
-  int client_num;
   vector<ClientGroup *> new_client_groups;
 
-  memset(full_path, 0, PATH_MAX);
-  strncpy(full_path, limit_file_dir, PATH_MAX);
+  memset(full_path, 0, sizeof(full_path));
+  strncpy(full_path, limit_file_dir, sizeof(full_path));
   if (limit_file_dir[strlen(limit_file_dir) - 1] != '/') full_path[strlen(limit_file_dir)] = '/';
-  strncat(full_path, limit_file_name, PATH_MAX - strlen(full_path));
+  strncat(full_path, limit_file_name, sizeof(full_path) - strlen(full_path));
 
   // Read GPU limit usage
-  fin.open(full_path, std::ios::in);
-  if (!fin.is_open()) {
-    ERROR("failed to open file %s: %s", full_path, strerror(errno));
-    exit(1);
-  }
-  fin >> client_num;
-  INFO("There are %d clients in the system...", client_num);
-  for (int i = 0; i < client_num; i++) {
-    fin >> client_name >> min_frac >> max_frac >> mem_limit;
+  ConfigFile config_file(full_path);
+  for (string group_name : config_file.getGroups()) {
+    min_frac = config_file.getDouble(group_name.c_str(), "MinUtil", 0.0);
+    max_frac = config_file.getDouble(group_name.c_str(), "MaxUtil", 1.0);
+    mem_limit = config_file.getSize(group_name.c_str(), "MemoryLimit", 1UL << 30);
 
-    // use existing group information (if exist)
-    if (client_group_map.find(client_name) != client_group_map.end()) {
-      group = client_group_map[client_name];
+    // look for existing group information, or create a new one if not found
+    if (client_group_map.find(group_name) != client_group_map.end()) {
+      group = client_group_map[group_name];
     } else {
-      group = new ClientGroup(client_name, QUOTA, MIN_QUOTA);
-      client_group_map[client_name] = group;
+      group = new ClientGroup(group_name, QUOTA, MIN_QUOTA);
+      client_group_map[group_name] = group;
       new_client_groups.push_back(group);
     }
 
+    // since we reuse existing object, scheduling thread can receive this update
     group->updateConstraint(min_frac, max_frac, max_frac * WINDOW_SIZE, mem_limit);
 
-    INFO("%s request: %.2f, limit: %.2f, memory limit: %lu bytes", client_name, min_frac, max_frac,
-         mem_limit);
+    INFO("%s MinUtil: %.2f, MaxUtil: %.2f, MemoryLimit: %lu B", group_name.c_str(), min_frac,
+         max_frac, mem_limit);
   }
-  fin.close();
-
   return new_client_groups;
 }
 
@@ -628,7 +622,6 @@ void monitorConfigFile(const char *path, const char *filename) {
 
       if (event->len) {
         if (event->mask & IN_CLOSE_WRITE) {
-          INFO("File %s modified with watch descriptor %d.", (const char *)event->name, event->wd);
           // if event is triggered by target file
           if (strcmp((const char *)event->name, filename) == 0) {
             INFO("Update resource configurations...");
