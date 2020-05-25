@@ -57,11 +57,11 @@ Changes to this file will be monitored by `gem-schd`. After each change, schedul
 
 ### Run
 
-Create directory `/tmp/gemini/client` if not exists. Unix domain socket files will reside in this directory.
+Specify a directory in environment variable `GEMINI_IPC_DIR` for keeping unix domain socket files. Default value is `/tmp/gemini/ipc`.
 
-When launching applications, set environment variable `GEMINI_GROUP_NAME` to name of client group and `LD_PRELOAD` to location of `libgemhook.so.1`. For convenience, we provide a Python script under `tools/` for launching applications (`launch-command.py`).
+When launching applications, set environment variable `GEMINI_GROUP_NAME` to name of client group and `LD_PRELOAD` to location of `libgemhook.so.1`.
 
-For more details, refer to script and source code.
+For convenience, we provide a Python script `tools/launch-command.py` for launching applications. Refer to scripts and source codes for more details.
 
 ## Contributors
 

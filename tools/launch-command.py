@@ -27,8 +27,12 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', help='client group name', required=True)
-    parser.add_argument('--port', help='backend port', required=True)
-    parser.add_argument('--ip', help='backend ip', default='127.0.0.1')
+    parser.add_argument('--ipc', help='IPC file directory')
+    parser.add_argument(
+        '--hook',
+        help='path to hook library',
+        default=f"{Path.home()}/gemini/lib/libgemhook.so.1"
+    )
     parser.add_argument('--timeout', type=int, help='seconds to run')
     parser.add_argument('command', nargs='+')
     args = parser.parse_args()
@@ -36,12 +40,10 @@ def main():
     os.setpgrp()
 
     client_env = os.environ.copy()
-    client_env['GEMINI_BACKEND_IP'] = args.ip
-    client_env['GEMINI_BACKEND_PORT'] = args.port
+    if args.ipc is not None:
+        client_env['GEMINI_IPC_DIR'] = args.ipc
     client_env['GEMINI_GROUP_NAME'] = args.name
-    client_env['LD_PRELOAD'] = "{}/gemini/lib/libgemhook.so.1".format(
-        Path.home()
-    )
+    client_env['LD_PRELOAD'] = args.hook
 
     proc = sp.Popen(
         args.command,
@@ -61,7 +63,7 @@ def main():
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except OSError as e:
-                warnings.warn(e)
+                warnings.warn(e.strerror)
         else:
             proc.wait()
     except KeyboardInterrupt:

@@ -54,10 +54,6 @@
 #include <typeinfo>
 #include <vector>
 
-#if __cplusplus >= 201703L
-#include <filesystem>
-#endif
-
 #include "comm/endpoint.hpp"
 #include "debug.h"
 #include "parse-config.h"
@@ -97,8 +93,10 @@ double WINDOW_SIZE = 10000.0;
 int verbosity = 0;
 
 auto PROGRESS_START = steady_clock::now();
-char limit_file_name[PATH_MAX] = "resource.conf";
-char limit_file_dir[PATH_MAX] = ".";
+
+// program options
+char limit_file[PATH_MAX] = "resource.conf";
+char ipc_dir[PATH_MAX] = "/tmp/gemini/ipc";
 
 void *zeromq_context;  // global zeromq context
 // map client name to pointer of ClientGroup
@@ -210,26 +208,19 @@ void ClientGroup::giveToken() { sem_post(&token_sem_); }
 /**
  * Read resource constraint config file and update client group constraints.
  * If new client group is found, create corresponding ClientGroup and add to client_group_map.
+ * @param file_path path to resource config file
  * @return a vector contains pointers to newly created ClientGroup entries.
  */
-vector<ClientGroup *> read_resource_config() {
-  ClientGroup *group;
-  char full_path[PATH_MAX];
-  size_t mem_limit;
-  double min_frac, max_frac;
+vector<ClientGroup *> read_resource_config(const char *file_path) {
   vector<ClientGroup *> new_client_groups;
 
-  memset(full_path, 0, sizeof(full_path));
-  strncpy(full_path, limit_file_dir, sizeof(full_path));
-  if (limit_file_dir[strlen(limit_file_dir) - 1] != '/') full_path[strlen(limit_file_dir)] = '/';
-  strncat(full_path, limit_file_name, sizeof(full_path) - strlen(full_path));
-
   // Read GPU limit usage
-  ConfigFile config_file(full_path);
+  ConfigFile config_file(file_path);
   for (string group_name : config_file.getGroups()) {
-    min_frac = config_file.getDouble(group_name.c_str(), "MinUtil", 0.0);
-    max_frac = config_file.getDouble(group_name.c_str(), "MaxUtil", 1.0);
-    mem_limit = config_file.getSize(group_name.c_str(), "MemoryLimit", 1UL << 30);
+    ClientGroup *group;
+    double min_frac = config_file.getDouble(group_name.c_str(), "MinUtil", 0.0);
+    double max_frac = config_file.getDouble(group_name.c_str(), "MaxUtil", 1.0);
+    size_t mem_limit = config_file.getSize(group_name.c_str(), "MemoryLimit", 1UL << 30);
 
     // look for existing group information, or create a new one if not found
     if (client_group_map.find(group_name) != client_group_map.end()) {
@@ -483,14 +474,7 @@ size_t removeDeadPeers(std::map<string, MemoryUsageRecord> &peers_status) {
 void *clientGroupMgmt(void *args) {
   ClientGroup *group = static_cast<ClientGroup *>(args);
   char url[PATH_MAX];
-  snprintf(url, PATH_MAX, "ipc:///tmp/gemini/client/%s", group->getName().c_str());
-
-#if __cplusplus >= 201703L
-  // create directory recursively
-  // std::filesystem::path ipc_file_path(url);
-  // std::filesystem::create_directories(ipc_file_path.remove_filename());
-  std::filesystem::create_directories("/tmp/gemini/client");
-#endif
+  snprintf(url, PATH_MAX, "ipc://%s/%s", ipc_dir, group->getName().c_str());
   Responder responder(zeromq_context, url);
 
   // allocated memory size and last heartbeat record of each client (peer)
@@ -588,10 +572,13 @@ void spawnClientGroupThreads(const vector<ClientGroup *> groups) {
 
 // Monitor the change to resource config file, and spawn new client group management threads if
 // needed.
-void monitorConfigFile(const char *path, const char *filename) {
+void monitorResourceConfigFile(const char *file_path) {
   const size_t kEventSize = sizeof(struct inotify_event);
   const size_t kBufLen = 1024 * (kEventSize + 16);
   int fd, wd;
+
+  char *dir = g_path_get_dirname(file_path);
+  char *base_name = g_path_get_basename(file_path);
 
   // Initialize Inotify
   fd = inotify_init();
@@ -601,13 +588,13 @@ void monitorConfigFile(const char *path, const char *filename) {
   }
 
   // add watch to starting directory
-  wd = inotify_add_watch(fd, path, IN_CLOSE_WRITE);
+  wd = inotify_add_watch(fd, dir, IN_CLOSE_WRITE);
 
   if (wd == -1) {
-    ERROR("Failed to add watch to '%s'.", path);
+    ERROR("Failed to add watch to '%s'.", dir);
     return;
   } else {
-    INFO("Watching '%s'.", path);
+    INFO("Watching '%s'.", dir);
   }
 
   // start watching
@@ -623,9 +610,9 @@ void monitorConfigFile(const char *path, const char *filename) {
       if (event->len) {
         if (event->mask & IN_CLOSE_WRITE) {
           // if event is triggered by target file
-          if (strcmp((const char *)event->name, filename) == 0) {
+          if (strcmp((const char *)event->name, base_name) == 0) {
             INFO("Update resource configurations...");
-            vector<ClientGroup *> new_client_groups = read_resource_config();
+            vector<ClientGroup *> new_client_groups = read_resource_config(file_path);
             spawnClientGroupThreads(new_client_groups);
           }
         }
@@ -642,23 +629,21 @@ void monitorConfigFile(const char *path, const char *filename) {
 }
 
 int main(int argc, char *argv[]) {
-  uint16_t schd_port = 50051;
   // parse command line options
-  const char *optstring = "P:q:m:w:f:p:v:h";
-  struct option opts[] = {{"port", required_argument, nullptr, 'P'},
+  const char *optstring = "p:q:m:w:f:v:h";
+  struct option opts[] = {{"ipc_dir", required_argument, nullptr, 'p'},
                           {"quota", required_argument, nullptr, 'q'},
                           {"min_quota", required_argument, nullptr, 'm'},
                           {"window", required_argument, nullptr, 'w'},
                           {"limit_file", required_argument, nullptr, 'f'},
-                          {"limit_file_dir", required_argument, nullptr, 'p'},
                           {"verbose", required_argument, nullptr, 'v'},
                           {"help", no_argument, nullptr, 'h'},
                           {nullptr, 0, nullptr, 0}};
   int opt;
   while ((opt = getopt_long(argc, argv, optstring, opts, NULL)) != -1) {
     switch (opt) {
-      case 'P':
-        schd_port = strtoul(optarg, nullptr, 10);
+      case 'p':
+        strncpy(ipc_dir, optarg, PATH_MAX);
         break;
       case 'q':
         QUOTA = atof(optarg);
@@ -670,10 +655,7 @@ int main(int argc, char *argv[]) {
         WINDOW_SIZE = atof(optarg);
         break;
       case 'f':
-        strncpy(limit_file_name, optarg, PATH_MAX - 1);
-        break;
-      case 'p':
-        strncpy(limit_file_dir, optarg, PATH_MAX - 1);
+        strncpy(limit_file, optarg, PATH_MAX);
         break;
       case 'v':
         verbosity = atoi(optarg);
@@ -681,12 +663,11 @@ int main(int argc, char *argv[]) {
       case 'h':
         printf("usage: %s [options]\n", argv[0]);
         puts("Options:");
-        puts("    -P [PORT], --port [PORT]");
+        puts("    -p [IPC_DIR], --ipc_dir [IPC_DIR]");
         puts("    -q [QUOTA], --quota [QUOTA]");
         puts("    -m [MIN_QUOTA], --min_quota [MIN_QUOTA]");
         puts("    -w [WINDOW_SIZE], --window [WINDOW_SIZE]");
         puts("    -f [LIMIT_FILE], --limit_file [LIMIT_FILE]");
-        puts("    -p [LIMIT_FILE_DIR], --limit_file_dir [LIMIT_FILE_DIR]");
         puts("    -v [LEVEL], --verbose [LEVEL]");
         puts("    -h, --help");
         return 0;
@@ -711,7 +692,16 @@ int main(int argc, char *argv[]) {
   zeromq_context = zmq_ctx_new();
 
   // read configuration file
-  vector<ClientGroup *> groups = read_resource_config();
+  vector<ClientGroup *> groups = read_resource_config(limit_file);
+
+  // create directory for IPC files
+  if (g_mkdir_with_parents(ipc_dir, 0777) == 0) {
+    INFO("Create %s for IPC files", ipc_dir);
+  } else {
+    ERROR("Failed to create directory (%s) for IPC files: %s", ipc_dir, strerror(errno));
+    zmq_ctx_term(zeromq_context);  // clean up
+    exit(EXIT_FAILURE);
+  }
 
   // initialize candidate_cond with CLOCK_MONOTONIC
   pthread_condattr_t attr_monotonic_clock;
@@ -731,7 +721,7 @@ int main(int argc, char *argv[]) {
 
   // Main thread complete creating initial child threads.
   // The remaining job is to watch for newcomers (new ClientGroup).
-  monitorConfigFile(limit_file_dir, limit_file_name);
+  monitorResourceConfigFile(limit_file);
 
   zmq_ctx_term(zeromq_context);
   return 0;

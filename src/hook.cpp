@@ -146,10 +146,7 @@ void *dlsym(void *handle, const char *symbol) {
 }
 
 /* connection with backend */
-char group_name[HOST_NAME_MAX];
-char client_random_id[9];  // hex string of a 32-bit random number
-char backend_ip[20] = "127.0.0.1";
-uint16_t backend_port = 50052;                           // default value
+char client_random_id[9];                                // hex string of a 32-bit random number
 pthread_mutex_t comm_mutex = PTHREAD_MUTEX_INITIALIZER;  // one communication at a time
 Requester *requester;
 
@@ -192,27 +189,27 @@ long long us_since(struct timespec begin) {
 }
 
 /**
- * get connection information from environment variables
+ * Set up connection to backend with information provided in environment variables.
  */
 void configure_connection() {
-  // get backend IP, default 127.0.0.1
-  char *ip = getenv("GEMINI_BACKEND_IP");
-  if (ip != NULL) strcpy(backend_ip, ip);
+  char group_name[HOST_NAME_MAX], ipc_dir[PATH_MAX] = "/tmp/gemini/ipc";
 
-  // get backend port, default 50052
-  char *port = getenv("GEMINI_BACKEND_PORT");
-  if (port != NULL) backend_port = atoi(port);
+  // get directory for IPC files
+  if (getenv("GEMINI_IPC_DIR") != nullptr) {
+    strncpy(ipc_dir, getenv("GEMINI_IPC_DIR"), sizeof(ipc_dir));
+  }
 
-  char *name = getenv("GEMINI_GROUP_NAME");
-  if (name != NULL) {
-    strcpy(group_name, name);
+  if (getenv("GEMINI_GROUP_NAME") != nullptr) {
+    strcpy(group_name, getenv("GEMINI_GROUP_NAME"));
   } else {
+    // use host name as group name
     gethostname(group_name, HOST_NAME_MAX);
   }
 
   char url[PATH_MAX];
-  snprintf(url, PATH_MAX, "ipc:///tmp/gemini/client/%s", group_name);
+  snprintf(url, PATH_MAX, "ipc://%s/%s", ipc_dir, group_name);
   requester = new Requester(nullptr, url);
+  DEBUG("Connected to %s", url);
 }
 
 /**
