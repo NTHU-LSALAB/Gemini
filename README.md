@@ -21,6 +21,7 @@ Currently we use **Unix domain socket** as the communication interface between c
 
 * `libzmq`
 * `glib-2.0`
+* `gio-2.0`
 
 ### Compile
 
