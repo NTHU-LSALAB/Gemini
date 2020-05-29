@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <getopt.h>
+#include <gio/gio.h>
 #include <linux/limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -67,7 +68,7 @@ using std::chrono::steady_clock;
 using std::chrono::time_point;
 
 // signal handler
-void sig_handler(int);
+void segvHandler(int);
 #ifdef _DEBUG
 void dump_history(int);
 #endif
@@ -110,6 +111,8 @@ std::list<History> history_list;
 #ifdef _DEBUG
 std::list<History> full_history;
 #endif
+
+GMainLoop *main_loop = nullptr;
 
 // milliseconds since scheduler process started
 inline double ms_since_start() {
@@ -570,62 +573,19 @@ void spawnClientGroupThreads(const vector<ClientGroup *> groups) {
   }
 }
 
+// Callback function when resource config file is changed.
 // Monitor the change to resource config file, and spawn new client group management threads if
 // needed.
-void monitorResourceConfigFile(const char *file_path) {
-  const size_t kEventSize = sizeof(struct inotify_event);
-  const size_t kBufLen = 1024 * (kEventSize + 16);
-  int fd, wd;
+void onResourceConfigFileUpdate(GFileMonitor *monitor, GFile *file, GFile *other_file,
+                                GFileMonitorEvent event_type, gpointer user_data) {
+  if (event_type == G_FILE_MONITOR_EVENT_CHANGED || event_type == G_FILE_MONITOR_EVENT_CREATED) {
+    INFO("Update resource configurations...");
 
-  char *dir = g_path_get_dirname(file_path);
-  char *base_name = g_path_get_basename(file_path);
-
-  // Initialize Inotify
-  fd = inotify_init();
-  if (fd < 0) {
-    ERROR("Failed to initialize inotify");
-    return;
+    char *path = g_file_get_path(file);
+    vector<ClientGroup *> new_client_groups = read_resource_config(path);
+    spawnClientGroupThreads(new_client_groups);
+    g_free(path);
   }
-
-  // add watch to starting directory
-  wd = inotify_add_watch(fd, dir, IN_CLOSE_WRITE);
-
-  if (wd == -1) {
-    ERROR("Failed to add watch to '%s'.", dir);
-    return;
-  } else {
-    INFO("Watching '%s'.", dir);
-  }
-
-  // start watching
-  while (true) {
-    int i = 0;
-    char buffer[kBufLen];
-    int length = read(fd, buffer, kBufLen);
-    if (length < 0) ERROR("Read error");
-
-    while (i < length) {
-      struct inotify_event *event = (struct inotify_event *)&buffer[i];
-
-      if (event->len) {
-        if (event->mask & IN_CLOSE_WRITE) {
-          // if event is triggered by target file
-          if (strcmp((const char *)event->name, base_name) == 0) {
-            INFO("Update resource configurations...");
-            vector<ClientGroup *> new_client_groups = read_resource_config(file_path);
-            spawnClientGroupThreads(new_client_groups);
-          }
-        }
-      }
-      // update index to start of next event
-      i += kEventSize + event->len;
-    }
-  }
-
-  // Clean up
-  // Supposed to be unreached.
-  inotify_rm_watch(fd, wd);
-  close(fd);
 }
 
 int main(int argc, char *argv[]) {
@@ -683,9 +643,9 @@ int main(int argc, char *argv[]) {
     printf("    %-20s %.3f ms\n", "time window:", WINDOW_SIZE);
   }
 
-  // register signal handler for debugging
-  signal(SIGSEGV, sig_handler);
 #ifdef _DEBUG
+  // register signal handler for debugging
+  signal(SIGSEGV, segvHandler);
   if (verbosity > 0) signal(SIGINT, dump_history);
 #endif
 
@@ -719,15 +679,32 @@ int main(int argc, char *argv[]) {
 
   spawnClientGroupThreads(groups);
 
-  // Main thread complete creating initial child threads.
-  // The remaining job is to watch for newcomers (new ClientGroup).
-  monitorResourceConfigFile(limit_file);
+  // Watch for newcomers (new ClientGroup).
+  GError *err = nullptr;
+  GFile *file = g_file_new_for_path(limit_file);
+  if (file == nullptr) {
+    ERROR("Failed to construct GFile for %s", limit_file);
+    exit(EXIT_FAILURE);
+  }
+  GFileMonitor *monitor = g_file_monitor(file, G_FILE_MONITOR_NONE, nullptr, &err);
+  if (monitor == nullptr || err != nullptr) {
+    ERROR("Failed to create monitor for %s: %s", limit_file, err->message);
+    exit(EXIT_FAILURE);
+  }
+
+  g_signal_connect(monitor, "changed", G_CALLBACK(onResourceConfigFileUpdate), nullptr);
+
+  // Wait for file change events
+  main_loop = g_main_loop_new(nullptr, false);
+  g_main_loop_run(main_loop);
+
+  g_object_unref(monitor);
 
   zmq_ctx_term(zeromq_context);
   return 0;
 }
 
-void sig_handler(int sig) {
+void segvHandler(int sig) {
   void *arr[10];
   size_t s;
   s = backtrace(arr, 10);

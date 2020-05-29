@@ -42,7 +42,7 @@ COMM_HEADERS = $(foreach file,$(COMM_FILES),comm/$(file).hpp)
 COMM_OBJS = $(foreach file,$(COMM_FILES),comm/$(file).o)
 
 # Third-party libraries
-EXTLIBS = libzmq glib-2.0
+EXTLIBS = libzmq glib-2.0 gio-2.0
 CXXFLAGS += $(foreach ext,$(EXTLIBS),$(shell $(PKGCONFIG) --cflags $(ext)))
 LDFLAGS += $(foreach ext,$(EXTLIBS),$(shell $(PKGCONFIG) --libs $(ext)))
 
