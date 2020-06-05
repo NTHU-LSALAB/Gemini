@@ -213,14 +213,35 @@ void configure_connection() {
 }
 
 /**
- * Record a host-side synchronous call and update predictor statistics.
+ * Synchronize with a CUDA event before host-side synchronous function, in order to capture the
+ * kernel burst length. Since we want kernel burst to contain the time of kernel execution only, we
+ * stop predictor recording before the sync operation starts. Therefore, time taken by sync
+ * operation will not be counted in kernel burst time, such as memory copy time.
  * @param func_name name of synchronous call
  */
-void host_sync_call(const char *func_name) {
+void preHostSyncCall(const char *func_name, cudaEvent_t event = nullptr) {
+  float elapsed_time = 0;
+  bool recycle = (event == nullptr);
+  if (recycle) cudaEventCreate(&event);
+  // force a synchronization
+  cudaEventRecord(event);
+  cudaEventSynchronize(event);
+  // destroy the object if no longer needed
+  if (recycle) cudaEventDestroy(event);
 #ifdef SYNCP_MESSAGE
-  DEBUG("SYNC (%s)", func_name);
+  DEBUG("PRE_SYNC (%s)", func_name);
 #endif
   burst_predictor.record_stop();
+}
+
+/**
+ * Start recording window period after host-side synchronous operation completes.
+ * @param func_name name of synchronous call
+ */
+void postHostSyncCall(const char *func_name) {
+#ifdef SYNCP_MESSAGE
+  DEBUG("POST_SYNC (%s)", func_name);
+#endif
   window_predictor.record_start();
 }
 
@@ -317,17 +338,16 @@ void *wait_cuda_kernels(void *args) {
     if (rc != ETIMEDOUT) DEBUG("overuse tracking thread interrupted");
     pthread_mutex_unlock(&overuse_trk_mutex);
 
-    // synchronize all running kernels
+    // block until preceding kernel completes, and update kernel burst & window statistics
     cudaEvent_t event;
     cudaEventCreate(&event);
-    cudaEventRecord(event);
-    cudaEventSynchronize(event);
+    preHostSyncCall("overuse measurement", event);
+    postHostSyncCall("overuse measurement");
 
-    // notify predictor we've done a synchronize
-    host_sync_call("overuse measurement");
-
+    // calculate overuse time
     float elapsed_ms;
     cudaEventElapsedTime(&elapsed_ms, cuevent_start, event);
+    cudaEventDestroy(event);
     overuse = std::max(0.0, (double)elapsed_ms - quota_time);
 
     DEBUG("overuse: %.3f ms", overuse);
@@ -557,31 +577,58 @@ CUresult cuMipmappedArrayCreate_posthook(CUmipmappedArray *pHandle,
   return CUDA_SUCCESS;
 }
 
+CUresult cuCtxSynchronize_prehook(void) {
+  preHostSyncCall("cuCtxSynchronize");
+  return CUDA_SUCCESS;
+}
+
 CUresult cuCtxSynchronize_posthook(void) {
-  host_sync_call("cuCtxSynchronize");
+  postHostSyncCall("cuCtxSynchronize");
+  return CUDA_SUCCESS;
+}
+
+CUresult cuMemcpyAtoH_prehook(void *dstHost, CUarray srcArray, size_t srcOffset, size_t ByteCount) {
+  preHostSyncCall("cuMemcpyAtoH");
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemcpyAtoH_posthook(void *dstHost, CUarray srcArray, size_t srcOffset,
                                size_t ByteCount) {
-  host_sync_call("cuMemcpyAtoH");
+  postHostSyncCall("cuMemcpyAtoH");
+  return CUDA_SUCCESS;
+}
+
+CUresult cuMemcpyDtoH_prehook(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
+  preHostSyncCall("cuMemcpyDtoH");
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemcpyDtoH_posthook(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
-  host_sync_call("cuMemcpyDtoH");
+  postHostSyncCall("cuMemcpyDtoH");
+  return CUDA_SUCCESS;
+}
+
+CUresult cuMemcpyHtoA_prehook(CUarray dstArray, size_t dstOffset, const void *srcHost,
+                              size_t ByteCount) {
+  preHostSyncCall("cuMemcpyHtoA");
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemcpyHtoA_posthook(CUarray dstArray, size_t dstOffset, const void *srcHost,
                                size_t ByteCount) {
-  host_sync_call("cuMemcpyHtoA");
+  postHostSyncCall("cuMemcpyHtoA");
+  return CUDA_SUCCESS;
+}
+
+CUresult cuMemcpyHtoD_prehook(CUarray dstArray, size_t dstOffset, const void *srcHost,
+                              size_t ByteCount, CUstream hStream) {
+  preHostSyncCall("cuMemcpyHtoD");
   return CUDA_SUCCESS;
 }
 
 CUresult cuMemcpyHtoD_posthook(CUarray dstArray, size_t dstOffset, const void *srcHost,
                                size_t ByteCount, CUstream hStream) {
-  host_sync_call("cuMemcpyHtoD");
+  postHostSyncCall("cuMemcpyHtoD");
   return CUDA_SUCCESS;
 }
 
@@ -590,32 +637,40 @@ void initialize() {
   srand(getpid() ^ time(nullptr));
   snprintf(client_random_id, sizeof(client_random_id), "%08x", rand());
 
-  // place post-hooks
+  // host-side synchronous calls
+  hook_inf.preHooks[CU_HOOK_MEMCPY_ATOH] = (void *)cuMemcpyAtoH_prehook;
+  hook_inf.preHooks[CU_HOOK_MEMCPY_DTOH] = (void *)cuMemcpyDtoH_prehook;
+  hook_inf.preHooks[CU_HOOK_MEMCPY_HTOA] = (void *)cuMemcpyHtoA_prehook;
+  hook_inf.preHooks[CU_HOOK_MEMCPY_HTOD] = (void *)cuMemcpyHtoD_prehook;
+  hook_inf.preHooks[CU_HOOK_CTX_SYNC] = (void *)cuCtxSynchronize_prehook;
   hook_inf.postHooks[CU_HOOK_MEMCPY_ATOH] = (void *)cuMemcpyAtoH_posthook;
   hook_inf.postHooks[CU_HOOK_MEMCPY_DTOH] = (void *)cuMemcpyDtoH_posthook;
   hook_inf.postHooks[CU_HOOK_MEMCPY_HTOA] = (void *)cuMemcpyHtoA_posthook;
   hook_inf.postHooks[CU_HOOK_MEMCPY_HTOD] = (void *)cuMemcpyHtoD_posthook;
   hook_inf.postHooks[CU_HOOK_CTX_SYNC] = (void *)cuCtxSynchronize_posthook;
 
-  hook_inf.postHooks[CU_HOOK_MEM_ALLOC] = (void *)cuMemAlloc_posthook;
-  hook_inf.postHooks[CU_HOOK_MEM_ALLOC_MANAGED] = (void *)cuMemAllocManaged_posthook;
-  hook_inf.postHooks[CU_HOOK_MEM_ALLOC_PITCH] = (void *)cuMemAllocPitch_posthook;
-  hook_inf.postHooks[CU_HOOK_ARRAY_CREATE] = (void *)cuArrayCreate_posthook;
-  hook_inf.postHooks[CU_HOOK_ARRAY3D_CREATE] = (void *)cuArray3DCreate_posthook;
-  hook_inf.postHooks[CU_HOOK_MIPMAPPED_ARRAY_CREATE] = (void *)cuMipmappedArrayCreate_posthook;
-  // place pre-hooks
-  hook_inf.preHooks[CU_HOOK_MEM_FREE] = (void *)cuMemFree_prehook;
-  hook_inf.preHooks[CU_HOOK_ARRAY_DESTROY] = (void *)cuArrayDestroy_prehook;
-  hook_inf.preHooks[CU_HOOK_MIPMAPPED_ARRAY_DESTROY] = (void *)cuMipmappedArrayDestroy_prehook;
-  hook_inf.preHooks[CU_HOOK_LAUNCH_KERNEL] = (void *)cuLaunchKernel_prehook;
-  hook_inf.preHooks[CU_HOOK_LAUNCH_COOPERATIVE_KERNEL] = (void *)cuLaunchCooperativeKernel_prehook;
-
+  // memory allocation
   hook_inf.preHooks[CU_HOOK_MEM_ALLOC] = (void *)cuMemAlloc_prehook;
   hook_inf.preHooks[CU_HOOK_MEM_ALLOC_MANAGED] = (void *)cuMemAllocManaged_prehook;
   hook_inf.preHooks[CU_HOOK_MEM_ALLOC_PITCH] = (void *)cuMemAllocPitch_prehook;
   hook_inf.preHooks[CU_HOOK_ARRAY_CREATE] = (void *)cuArrayCreate_prehook;
   hook_inf.preHooks[CU_HOOK_ARRAY3D_CREATE] = (void *)cuArray3DCreate_prehook;
   hook_inf.preHooks[CU_HOOK_MIPMAPPED_ARRAY_CREATE] = (void *)cuMipmappedArrayCreate_prehook;
+  hook_inf.postHooks[CU_HOOK_MEM_ALLOC] = (void *)cuMemAlloc_posthook;
+  hook_inf.postHooks[CU_HOOK_MEM_ALLOC_MANAGED] = (void *)cuMemAllocManaged_posthook;
+  hook_inf.postHooks[CU_HOOK_MEM_ALLOC_PITCH] = (void *)cuMemAllocPitch_posthook;
+  hook_inf.postHooks[CU_HOOK_ARRAY_CREATE] = (void *)cuArrayCreate_posthook;
+  hook_inf.postHooks[CU_HOOK_ARRAY3D_CREATE] = (void *)cuArray3DCreate_posthook;
+  hook_inf.postHooks[CU_HOOK_MIPMAPPED_ARRAY_CREATE] = (void *)cuMipmappedArrayCreate_posthook;
+
+  // memory deallocation
+  hook_inf.preHooks[CU_HOOK_MEM_FREE] = (void *)cuMemFree_prehook;
+  hook_inf.preHooks[CU_HOOK_ARRAY_DESTROY] = (void *)cuArrayDestroy_prehook;
+  hook_inf.preHooks[CU_HOOK_MIPMAPPED_ARRAY_DESTROY] = (void *)cuMipmappedArrayDestroy_prehook;
+
+  // kernel execution
+  hook_inf.preHooks[CU_HOOK_LAUNCH_KERNEL] = (void *)cuLaunchKernel_prehook;
+  hook_inf.preHooks[CU_HOOK_LAUNCH_COOPERATIVE_KERNEL] = (void *)cuLaunchCooperativeKernel_prehook;
 
   configure_connection();
 
