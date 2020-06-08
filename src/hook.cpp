@@ -46,9 +46,11 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <random>
 #include <sstream>
+#include <unordered_map>
 
 #include "comm/endpoint.hpp"
 #include "debug.h"
@@ -145,6 +147,63 @@ void *dlsym(void *handle, const char *symbol) {
   return (real_dlsym(handle, symbol));
 }
 
+class BurstProgress {
+ private:
+  std::mutex mutex_;
+  std::unordered_map<CUfunction, uint32_t> burst_kernel_count_;
+  CUfunction start_func_;
+  uint32_t launch_count_;
+
+ public:
+  BurstProgress() {
+    start_func_ = nullptr;
+    launch_count_ = 0;
+  }
+
+  ~BurstProgress() {}
+
+  bool started() {
+    std::lock_guard<std::mutex> lg(mutex_);
+    return start_func_ != nullptr;
+  }
+
+  void setBurstStartFunc(CUfunction f) {
+    std::lock_guard<std::mutex> lg(mutex_);
+    start_func_ = f;
+  }
+
+  // get current progress; assume each kernel in a kernel burst has same duration.
+  double currentProgress() {
+    std::lock_guard<std::mutex> lg(mutex_);
+    // if no burst measured, currentProgress will always return 0, so hook never early stops
+    if (start_func_ == nullptr ||
+        burst_kernel_count_.find(start_func_) == burst_kernel_count_.end()) {
+      return 0.0;
+    }
+    return launch_count_ / (double)burst_kernel_count_[start_func_];
+  }
+
+  // increase counter
+  void step() {
+    std::lock_guard<std::mutex> lg(mutex_);
+    launch_count_++;
+  }
+
+  // save last record and restart counter
+  void reset() {
+    std::lock_guard<std::mutex> lg(mutex_);
+    if (start_func_ == nullptr) return;
+    if (burst_kernel_count_.find(start_func_) == burst_kernel_count_.end()) {
+      burst_kernel_count_[start_func_] = launch_count_;
+    } else {
+      // exponential decay (new 3 : 1 old)
+      burst_kernel_count_[start_func_] = (burst_kernel_count_[start_func_] + 3 * launch_count_) / 4;
+    }
+    start_func_ = nullptr;
+    launch_count_ = 0;
+  }
+};
+
 /* connection with backend */
 char client_random_id[9];                                // hex string of a 32-bit random number
 pthread_mutex_t comm_mutex = PTHREAD_MUTEX_INITIALIZER;  // one communication at a time
@@ -159,6 +218,7 @@ pthread_mutex_t request_time_mutex = PTHREAD_MUTEX_INITIALIZER;
 const double SCHD_OVERHEAD = 2.0;                   // ms
 Predictor burst_predictor("burst", SCHD_OVERHEAD);  // predicted burst may not be the full burst
 Predictor window_predictor("window");
+BurstProgress burst_progress;
 
 pthread_mutex_t expiration_status_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -232,6 +292,7 @@ void preHostSyncCall(const char *func_name, cudaEvent_t event = nullptr) {
   DEBUG("PRE_SYNC (%s)", func_name);
 #endif
   burst_predictor.record_stop();
+  burst_progress.reset();
 }
 
 /**
@@ -398,10 +459,17 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
   window_predictor.record_stop();
 
   pthread_mutex_lock(&expiration_status_mutex);
-  // allow the kernel to launch if kernel burst already begins;
-  // otherwise, obtain a new token if this kernel burst may cause overuse
-  if (!burst_predictor.ongoing_unmerged() &&
-      us_since(request_start) / 1e3 + burst_predictor.predict_unmerged() >= quota_time) {
+
+  // increase progress counter first, and see if this kernel launch will cause overuse
+  if (!burst_progress.started()) {
+    burst_progress.setBurstStartFunc(f);
+  }
+  burst_progress.step();
+  
+  // obtain a new token if this kernel may cause overuse
+  if (us_since(request_start) / 1e3 +
+          burst_predictor.predict_unmerged() * burst_progress.currentProgress() >=
+      quota_time) {
     // estimate the duration of next kernel burst (merged)
     next_burst =
         estimate_full_burst(burst_predictor.predict_merged(), window_predictor.predict_merged());
