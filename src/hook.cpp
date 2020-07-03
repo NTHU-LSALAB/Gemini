@@ -465,7 +465,7 @@ CUresult cuLaunchKernel_prehook(CUfunction f, unsigned int gridDimX, unsigned in
     burst_progress.setBurstStartFunc(f);
   }
   burst_progress.step();
-  
+
   // obtain a new token if this kernel may cause overuse
   if (us_since(request_start) / 1e3 +
           burst_predictor.predict_unmerged() * burst_progress.currentProgress() >=

@@ -20,7 +20,7 @@
 #include <pthread.h>
 
 #include <chrono>
-#include <deque>
+#include <list>
 
 typedef std::chrono::time_point<std::chrono::_V2::steady_clock> timepoint_t;
 
@@ -33,10 +33,11 @@ class RecordKeeper {
   void drop_outdated(const timepoint_t);
   void clear();
   double get_max();
+  double get_percentile(double);
 
  private:
   const int64_t VALID_TIME;
-  std::deque<std::pair<timepoint_t, double>> records_;
+  std::list<std::pair<timepoint_t, double>> records_;
 };
 
 class Predictor {

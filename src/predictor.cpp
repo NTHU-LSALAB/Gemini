@@ -25,6 +25,10 @@
 
 #include "predictor.h"
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 #include "debug.h"
 
 using std::make_pair;
@@ -37,9 +41,8 @@ using std::chrono::steady_clock;
 
 RecordKeeper::RecordKeeper(const int64_t valid_time) : VALID_TIME(valid_time) {}
 
-// maintains the decreasing property, for O(1) time complexity
+// records are ordered by coming time
 void RecordKeeper::add(const double data, const timepoint_t tp) {
-  while (!records_.empty() && records_.back().second < data) records_.pop_back();
   records_.push_back(make_pair(tp, data));
 }
 
@@ -55,6 +58,18 @@ double RecordKeeper::get_max() {
     return 0.0;
   else
     return records_.front().second;
+}
+
+// average O(n)
+double RecordKeeper::get_percentile(double percentile) {
+  if (records_.empty()) return 0.0;
+  unsigned long nth = round((records_.size() - 1) * percentile);  // 0 ~ size-1
+  std::vector<double> values;
+  for (auto p : records_) {
+    values.push_back(p.second);
+  }
+  std::nth_element(values.begin(), values.begin() + nth, values.end());
+  return values[nth];
 }
 
 void RecordKeeper::clear() { records_.clear(); }
@@ -143,7 +158,7 @@ double Predictor::predict_unmerged() {
 #ifndef NO_PREDICT
   pthread_mutex_lock(&mutex_);
   normal_records.drop_outdated(steady_clock::now());
-  pred = normal_records.get_max();
+  pred = normal_records.get_percentile(0.9);
   pthread_mutex_unlock(&mutex_);
 #endif
   return pred;
@@ -156,7 +171,7 @@ double Predictor::predict_merged() {
 #ifndef NO_PREDICT
   pthread_mutex_lock(&mutex_);
   long_records.drop_outdated(steady_clock::now());
-  pred = long_records.get_max();
+  pred = long_records.get_percentile(0.9);
   pthread_mutex_unlock(&mutex_);
 #endif
   return pred;
