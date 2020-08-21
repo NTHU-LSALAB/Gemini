@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # path to CUDA installation
-CUDA_PATH ?= /usr/local/cuda-10.0
+CUDA_PATH ?= /usr/local/cuda
 PWD := $(shell pwd)
 PREFIX ?= $(PWD)/..
 INSTALL = /usr/bin/install
@@ -61,8 +61,8 @@ predictor.o: predictor.cpp predictor.h debug.h
 	$(CXX) $(CXXFLAGS) -o $@ -c $<
 
 libgemhook.so.1: hook.o predictor.o debug.o comm
-	$(NVCC) -shared -m64 $(GENCODE_FLAGS) $(CUDA_LDFLAGS) $(LDFLAGS) -o $@ \
-		hook.o predictor.o debug.o $(COMM_OBJS)
+	$(NVCC) hook.o predictor.o debug.o $(COMM_OBJS) \
+		-shared -m64 $(GENCODE_FLAGS) $(CUDA_LDFLAGS) $(LDFLAGS) -o $@
 	mkdir -p $(PREFIX)/lib
 	$(INSTALL) -s -m 755 -t $(PREFIX)/lib $@
 
@@ -76,8 +76,8 @@ parse-config.o: parse-config.cpp parse-config.h
 	$(CXX) $(CXXFLAGS) -o $@ -c $<
 
 gem-schd: scheduler.o schd-priority.o debug.o parse-config.o comm
-	$(CXX) $(LDFLAGS) -pthread -rdynamic -o $@ \
-		scheduler.o schd-priority.o debug.o parse-config.o $(COMM_OBJS)
+	$(CXX) scheduler.o schd-priority.o debug.o parse-config.o $(COMM_OBJS) \
+		$(LDFLAGS) -pthread -rdynamic -o $@
 	mkdir -p $(PREFIX)/bin
 	$(INSTALL) -s -m 755 -t $(PREFIX)/bin $@
 
