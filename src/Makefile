@@ -77,7 +77,7 @@ parse-config.o: parse-config.cpp parse-config.h
 
 gem-schd: scheduler.o schd-priority.o debug.o parse-config.o comm
 	$(CXX) scheduler.o schd-priority.o debug.o parse-config.o $(COMM_OBJS) \
-		$(LDFLAGS) -pthread -rdynamic -o $@
+		$(LDFLAGS) -pthread -o $@
 	mkdir -p $(PREFIX)/bin
 	$(INSTALL) -s -m 755 -t $(PREFIX)/bin $@
 

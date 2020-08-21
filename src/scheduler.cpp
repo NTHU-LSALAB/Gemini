@@ -645,7 +645,6 @@ int main(int argc, char *argv[]) {
 
 #ifdef _DEBUG
   // register signal handler for debugging
-  signal(SIGSEGV, segvHandler);
   if (verbosity > 0) signal(SIGINT, dump_history);
 #endif
 
@@ -702,15 +701,6 @@ int main(int argc, char *argv[]) {
 
   zmq_ctx_term(zeromq_context);
   return 0;
-}
-
-void segvHandler(int sig) {
-  void *arr[10];
-  size_t s;
-  s = backtrace(arr, 10);
-  ERROR("Received signal %d", sig);
-  backtrace_symbols_fd(arr, s, STDERR_FILENO);
-  exit(sig);
 }
 
 #ifdef _DEBUG
