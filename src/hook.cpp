@@ -362,10 +362,17 @@ double estimate_full_burst(double measured_burst, double measured_window) {
  * @return received time quota (milliseconds)
  */
 double get_token_from_scheduler(double next_burst) {
-  TokenRequest request(client_random_id, overuse, next_burst);
-  TokenResponse response;
-  requester->submit(request, &response);
-  return response.quota();
+  // !! Note: prefetch token request must always preceed kernel token request !!
+  PrefetchTokenRequest prefetch_request(client_random_id, overuse, next_burst);
+  requester->submit(prefetch_request, nullptr);
+  DEBUG("received prefetch token");
+  // TODO: start prefetch
+
+  KernelTokenRequest kernel_request(client_random_id, overuse, next_burst);
+  KernelTokenResponse kernel_response;
+  requester->submit(kernel_request, &kernel_response);
+  DEBUG("received kernel token (quota: %.3f)", kernel_response.quota());
+  return kernel_response.quota();
 }
 
 /**

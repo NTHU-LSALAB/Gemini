@@ -50,6 +50,7 @@
 #include <limits>
 #include <list>
 #include <map>
+#include <queue>
 #include <string>
 #include <thread>
 #include <typeinfo>
@@ -125,10 +126,15 @@ ClientGroup::ClientGroup(std::string name, double baseq, double minq)
   latest_overuse_ = 0.0;
   latest_actual_usage_ = 0.0;
   burst_ = 0.0;
-  sem_init(&token_sem_, 0, 0);  // set initial value to 0
+  sem_init(&kernel_token_sem_, 0, 0);    // set initial value to 0
+  sem_init(&prefetch_token_sem_, 0, 0);  // set initial value to 0
+  already_give_prefetch_token_ = false;
 };
 
-ClientGroup::~ClientGroup() { sem_destroy(&token_sem_); };
+ClientGroup::~ClientGroup() {
+  sem_destroy(&kernel_token_sem_);
+  sem_destroy(&prefetch_token_sem_);
+};
 
 const string &ClientGroup::getName() { return kName; }
 
@@ -203,10 +209,27 @@ void ClientGroup::updateQuota() {
 double ClientGroup::getQuota() { return quota_; }
 
 // wait until semaphore becomes positive
-void ClientGroup::waitToken() { sem_wait(&token_sem_); }
+void ClientGroup::waitKernelToken() { sem_wait(&kernel_token_sem_); }
+
+void ClientGroup::waitPrefetchToken() { sem_wait(&prefetch_token_sem_); }
 
 // notify waiting thread
-void ClientGroup::giveToken() { sem_post(&token_sem_); }
+/**
+ * Wake up thread which is waiting on kernel token. Also unblocks the thread if the thread is
+ * waiting on a prefetch token.
+ */
+void ClientGroup::giveKernelToken() {
+  if (!already_give_prefetch_token_) {
+    givePrefetchToken();
+  }
+  sem_post(&kernel_token_sem_);
+  already_give_prefetch_token_ = false;
+}
+
+void ClientGroup::givePrefetchToken() {
+  sem_post(&prefetch_token_sem_);
+  already_give_prefetch_token_ = true;
+}
 
 /**
  * Read resource constraint config file and update client group constraints.
@@ -386,33 +409,57 @@ Candidate select_candidate() {
  */
 void *schedule_daemon_func(void *) {
   double quota;
+  std::queue<Candidate> pending_candidates;  // candidates which have already selected for token
 
   while (1) {
+    string selected_name;
     pthread_mutex_lock(&candidate_mutex);
-    if (candidates.size() != 0) {
-      string selected_name;
-      // remove an entry from candidates
-      Candidate selected = select_candidate();
-      pthread_mutex_unlock(&candidate_mutex);
+
+    // there should be at most one pending client group which receives prefetch token in previous
+    // round
+    assert(pending_candidates.size() < 2);
+
+    // fill up pending candidates with up to 2 client groups
+    // (one to give kernel token, one to allow prefetch)
+    while (pending_candidates.size() < 2 && !candidates.empty()) {
+      Candidate new_pending_candidate = select_candidate();
+      pending_candidates.push(new_pending_candidate);
+    }
+    pthread_mutex_unlock(&candidate_mutex);
+
+    if (!pending_candidates.empty()) {
+      Candidate selected = pending_candidates.front();
+      pending_candidates.pop();
 
       selected_name = selected.group_ptr->getName();
-
-      DEBUG("select %s, waiting time: %.3f ms", selected_name.c_str(),
-            ms_since_start() - selected.arrived_time);
-
       selected.group_ptr->updateQuota();
       quota = selected.group_ptr->getQuota();
       selected.group_ptr->record(quota);
 
+      DEBUG("select %s to give kernel token (%.3f ms)", selected_name.c_str(), quota);
+
       // wake the waiting thread up
       // group management thread will send token to client group
-      selected.group_ptr->giveToken();
+      selected.group_ptr->giveKernelToken();
+    }
 
+    if (!pending_candidates.empty()) {
+      ClientGroup *prefetch_group = pending_candidates.front().group_ptr;
+      DEBUG("select %s to give prefetch token", prefetch_group->getName().c_str());
+      // this client group will get kernel token in next round
+      prefetch_group->givePrefetchToken();
+    }
+
+    pthread_mutex_lock(&candidate_mutex);
+    if (pending_candidates.empty() && candidates.empty()) {
+      // wait for new client group comes
+      DEBUG("no candidates");
+      pthread_cond_wait(&candidate_cond, &candidate_mutex);
+    } else {
       struct timespec ts = get_timespec_after(quota);
 
       // wait until the selected one's quota time out
       bool should_wait = true;
-      pthread_mutex_lock(&candidate_mutex);
       while (should_wait) {
         int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
         if (rc == ETIMEDOUT) {
@@ -428,13 +475,8 @@ void *schedule_daemon_func(void *) {
           }
         }
       }
-      pthread_mutex_unlock(&candidate_mutex);
-    } else {
-      // wait for new client group comes
-      DEBUG("no candidates");
-      pthread_cond_wait(&candidate_cond, &candidate_mutex);
-      pthread_mutex_unlock(&candidate_mutex);
     }
+    pthread_mutex_unlock(&candidate_mutex);
   }
 }
 
@@ -524,8 +566,8 @@ void *clientGroupMgmt(void *args) {
             std::min(mem_alloc_req.deltaSize(), peers_status[req.from()].first);
         rsp = new MemAllocResponse(true);
       }
-    } else if (req.what() == kToken) {
-      TokenRequest token_req(req);
+    } else if (req.what() == kPrefetchToken) {
+      PrefetchTokenRequest token_req(req);
       double remain = duration_cast<milliseconds>(token_expire - steady_clock::now()).count();
       if (remain < token_req.nextBurst()) {
         // remaining time is not enough
@@ -539,13 +581,20 @@ void *clientGroupMgmt(void *args) {
         pthread_mutex_unlock(&candidate_mutex);
 
         // block and wait for response
-        // if waitToken returns immediately, it means that scheduling daemon already gives out token
-        group->waitToken();
+        group->waitPrefetchToken();
+      }
+      rsp = new PrefetchTokenResponse();
+    } else if (req.what() == kKernelToken) {
+      KernelTokenRequest token_req(req);
+      double remain = duration_cast<milliseconds>(token_expire - steady_clock::now()).count();
 
+      if (remain < token_req.nextBurst()) {
+        group->waitKernelToken();
         remain = group->getQuota();
         token_expire = steady_clock::now() + milliseconds(static_cast<int64_t>(remain));
       }
-      rsp = new TokenResponse(remain);
+
+      rsp = new KernelTokenResponse(remain);
     } else {
       ERROR("Client group %s received an unknown request from client %s", group->getName().c_str(),
             req.from().c_str());

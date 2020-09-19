@@ -1,12 +1,12 @@
 /**
  * Copyright 2020 Hung-Hsin Chen, LSA Lab, National Tsing Hua University
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -28,11 +28,17 @@ class Response : public Message {
   virtual ~Response();
 };
 
-class TokenResponse : public Response {
+class PrefetchTokenResponse : public Response {
  public:
-  TokenResponse();
-  TokenResponse(double quota);
-  TokenResponse(vector<zmq_msg_t> &zmq_frames);
+  PrefetchTokenResponse();
+  PrefetchTokenResponse(vector<zmq_msg_t> &zmq_frames);
+};
+
+class KernelTokenResponse : public Response {
+ public:
+  KernelTokenResponse();
+  KernelTokenResponse(double quota);
+  KernelTokenResponse(vector<zmq_msg_t> &zmq_frames);
   double quota();
 };
 

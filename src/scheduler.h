@@ -47,8 +47,10 @@ class ClientGroup {
   double maxFrac();
   double getQuota();
   void updateQuota();
-  void waitToken();
-  void giveToken();
+  void waitKernelToken();
+  void waitPrefetchToken();
+  void giveKernelToken();
+  void givePrefetchToken();
   std::map<unsigned long long, size_t> memory_map;
 
  private:
@@ -63,7 +65,8 @@ class ClientGroup {
   double latest_overuse_;
   double latest_actual_usage_;  // client may return eariler (before quota expire)
   double burst_;                // duration of kernel burst
-  sem_t token_sem_;
+  sem_t kernel_token_sem_, prefetch_token_sem_;
+  bool already_give_prefetch_token_;
 };
 
 struct Candidate {

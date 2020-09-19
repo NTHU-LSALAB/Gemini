@@ -1,12 +1,12 @@
 /**
  * Copyright 2020 Hung-Hsin Chen, LSA Lab, National Tsing Hua University
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -37,20 +37,36 @@ Request::~Request() {}
 
 string Request::from() { return string(frames_[1].first); }
 
-TokenRequest::TokenRequest(const char *client_name, double overuse, double next_burst)
+KernelTokenRequest::KernelTokenRequest(const char *client_name, double overuse, double next_burst)
     : Request(client_name) {
-  setType(kToken);
+  setType(kKernelToken);
   addFrame(&overuse, sizeof(double));
   addFrame(&next_burst, sizeof(double));
 }
 
-TokenRequest::TokenRequest(Request &base_request) : Request(base_request) {
-  assert(what() == kToken);
+KernelTokenRequest::KernelTokenRequest(Request &base_request) : Request(base_request) {
+  assert(what() == kKernelToken);
 }
 
-double TokenRequest::overuse() { return *reinterpret_cast<double *>(frames_[2].first); }
+double KernelTokenRequest::overuse() { return *reinterpret_cast<double *>(frames_[2].first); }
 
-double TokenRequest::nextBurst() { return *reinterpret_cast<double *>(frames_[3].first); }
+double KernelTokenRequest::nextBurst() { return *reinterpret_cast<double *>(frames_[3].first); }
+
+PrefetchTokenRequest::PrefetchTokenRequest(const char *client_name, double overuse,
+                                           double next_burst)
+    : Request(client_name) {
+  setType(kPrefetchToken);
+  addFrame(&overuse, sizeof(double));
+  addFrame(&next_burst, sizeof(double));
+}
+
+PrefetchTokenRequest::PrefetchTokenRequest(Request &base_request) : Request(base_request) {
+  assert(what() == kPrefetchToken);
+}
+
+double PrefetchTokenRequest::overuse() { return *reinterpret_cast<double *>(frames_[2].first); }
+
+double PrefetchTokenRequest::nextBurst() { return *reinterpret_cast<double *>(frames_[3].first); }
 
 MemInfoRequest::MemInfoRequest(const char *client_name) : Request(client_name) {
   setType(kMemInfo);

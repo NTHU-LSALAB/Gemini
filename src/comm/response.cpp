@@ -1,12 +1,12 @@
 /**
  * Copyright 2020 Hung-Hsin Chen, LSA Lab, National Tsing Hua University
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -22,18 +22,24 @@ Response::Response(vector<zmq_msg_t> &zmq_frames) : Message(zmq_frames) {}
 
 Response::~Response() {}
 
-TokenResponse::TokenResponse() : Response() {}
+KernelTokenResponse::KernelTokenResponse() : Response() {}
 
-TokenResponse::TokenResponse(double quota) : Response() {
-  setType(kToken);
+KernelTokenResponse::KernelTokenResponse(double quota) : Response() {
+  setType(kKernelToken);
   addFrame(&quota, sizeof(double));
 }
 
-TokenResponse::TokenResponse(vector<zmq_msg_t> &zmq_frames) : Response(zmq_frames) {
-  assert(what() == kToken);
+KernelTokenResponse::KernelTokenResponse(vector<zmq_msg_t> &zmq_frames) : Response(zmq_frames) {
+  assert(what() == kKernelToken);
 }
 
-double TokenResponse::quota() { return *reinterpret_cast<double *>(frames_[1].first); }
+double KernelTokenResponse::quota() { return *reinterpret_cast<double *>(frames_[1].first); }
+
+PrefetchTokenResponse::PrefetchTokenResponse() : Response() { setType(kPrefetchToken); }
+
+PrefetchTokenResponse::PrefetchTokenResponse(vector<zmq_msg_t> &zmq_frames) : Response(zmq_frames) {
+  assert(what() == kPrefetchToken);
+}
 
 MemInfoResponse::MemInfoResponse() : Response() {}
 
