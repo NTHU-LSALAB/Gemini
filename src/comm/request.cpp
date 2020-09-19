@@ -68,6 +68,19 @@ double PrefetchTokenRequest::overuse() { return *reinterpret_cast<double *>(fram
 
 double PrefetchTokenRequest::nextBurst() { return *reinterpret_cast<double *>(frames_[3].first); }
 
+PrefetchRequest::PrefetchRequest(const char *client_name, size_t bytes): Request(client_name) {
+  setType(kPrefetch);
+  addFrame(&bytes, sizeof(size_t));
+}
+
+PrefetchRequest::PrefetchRequest(Request &base_request): Request(base_request) {
+  assert(what() == kPrefetch);
+}
+
+size_t PrefetchRequest::prefetchSize() {
+  return *reinterpret_cast<size_t *>(frames_[2].first);
+}
+
 MemInfoRequest::MemInfoRequest(const char *client_name) : Request(client_name) {
   setType(kMemInfo);
 }

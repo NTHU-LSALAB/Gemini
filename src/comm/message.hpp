@@ -27,7 +27,15 @@ using std::pair;
 using std::string;
 using std::vector;
 
-enum ServiceType { kKernelToken, kPrefetchToken, kMemInfo, kMemAlloc, kHeartbeat, kUnknown };
+enum ServiceType {
+  kKernelToken,
+  kPrefetchToken,
+  kPrefetch,
+  kMemInfo,
+  kMemAlloc,
+  kHeartbeat,
+  kUnknown
+};
 
 class Endpoint;
 

@@ -42,6 +42,14 @@ class KernelTokenResponse : public Response {
   double quota();
 };
 
+class PrefetchResponse : public Response {
+ public:
+  PrefetchResponse();
+  PrefetchResponse(bool permitted);
+  PrefetchResponse(vector<zmq_msg_t> &zmq_frames);
+  bool permitted();
+};
+
 class MemInfoResponse : public Response {
  public:
   MemInfoResponse();

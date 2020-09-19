@@ -129,6 +129,8 @@ ClientGroup::ClientGroup(std::string name, double baseq, double minq)
   sem_init(&kernel_token_sem_, 0, 0);    // set initial value to 0
   sem_init(&prefetch_token_sem_, 0, 0);  // set initial value to 0
   already_give_prefetch_token_ = false;
+  peer_memory_usage_ = 0UL;
+  expected_memory_usage_ = 0UL;
 };
 
 ClientGroup::~ClientGroup() {
@@ -209,24 +211,32 @@ void ClientGroup::updateQuota() {
 double ClientGroup::getQuota() { return quota_; }
 
 // wait until semaphore becomes positive
-void ClientGroup::waitKernelToken() { sem_wait(&kernel_token_sem_); }
+void ClientGroup::waitKernelToken(size_t memory_usage) {
+  sem_wait(&kernel_token_sem_);
+  expected_memory_usage_ = memory_usage;
+}
 
 void ClientGroup::waitPrefetchToken() { sem_wait(&prefetch_token_sem_); }
+
+size_t ClientGroup::getExpectedMemoryUsage() { return expected_memory_usage_; }
+
+size_t ClientGroup::getPeerMemoryUsage() { return peer_memory_usage_; }
 
 // notify waiting thread
 /**
  * Wake up thread which is waiting on kernel token. Also unblocks the thread if the thread is
  * waiting on a prefetch token.
  */
-void ClientGroup::giveKernelToken() {
+void ClientGroup::giveKernelToken(size_t peer_memory_usage) {
   if (!already_give_prefetch_token_) {
-    givePrefetchToken();
+    givePrefetchToken(peer_memory_usage);
   }
   sem_post(&kernel_token_sem_);
   already_give_prefetch_token_ = false;
 }
 
-void ClientGroup::givePrefetchToken() {
+void ClientGroup::givePrefetchToken(size_t peer_memory_usage) {
+  peer_memory_usage_ = peer_memory_usage;
   sem_post(&prefetch_token_sem_);
   already_give_prefetch_token_ = true;
 }
@@ -427,8 +437,9 @@ void *schedule_daemon_func(void *) {
     }
     pthread_mutex_unlock(&candidate_mutex);
 
+    Candidate selected;
     if (!pending_candidates.empty()) {
-      Candidate selected = pending_candidates.front();
+      selected = pending_candidates.front();
       pending_candidates.pop();
 
       selected_name = selected.group_ptr->getName();
@@ -440,6 +451,7 @@ void *schedule_daemon_func(void *) {
 
       // wake the waiting thread up
       // group management thread will send token to client group
+      // no restriction on prefetch size
       selected.group_ptr->giveKernelToken();
     }
 
@@ -447,7 +459,9 @@ void *schedule_daemon_func(void *) {
       ClientGroup *prefetch_group = pending_candidates.front().group_ptr;
       DEBUG("select %s to give prefetch token", prefetch_group->getName().c_str());
       // this client group will get kernel token in next round
-      prefetch_group->givePrefetchToken();
+      const size_t kGpuMemoryCapacity = 10 * (1UL << 30);
+
+      prefetch_group->givePrefetchToken(selected.group_ptr->getExpectedMemoryUsage());
     }
 
     pthread_mutex_lock(&candidate_mutex);
@@ -523,7 +537,7 @@ void *clientGroupMgmt(void *args) {
   Responder responder(zeromq_context, url);
 
   // allocated memory size and last heartbeat record of each client (peer)
-  size_t total_used_memory = 0UL;
+  size_t total_used_memory = 0UL, total_prefetched_memory = 0UL;
   std::map<string, MemoryUsageRecord> peers_status;
   time_point<steady_clock> token_expire = steady_clock::now();
 
@@ -569,6 +583,7 @@ void *clientGroupMgmt(void *args) {
     } else if (req.what() == kPrefetchToken) {
       PrefetchTokenRequest token_req(req);
       double remain = duration_cast<milliseconds>(token_expire - steady_clock::now()).count();
+
       if (remain < token_req.nextBurst()) {
         // remaining time is not enough
         group->updateReturnTime(token_req.overuse());
@@ -582,20 +597,34 @@ void *clientGroupMgmt(void *args) {
 
         // block and wait for response
         group->waitPrefetchToken();
+        total_prefetched_memory = 0;
       }
+
       rsp = new PrefetchTokenResponse();
     } else if (req.what() == kKernelToken) {
       KernelTokenRequest token_req(req);
       double remain = duration_cast<milliseconds>(token_expire - steady_clock::now()).count();
 
       if (remain < token_req.nextBurst()) {
-        group->waitKernelToken();
+        group->waitKernelToken(total_used_memory);
         remain = group->getQuota();
         token_expire = steady_clock::now() + milliseconds(static_cast<int64_t>(remain));
       }
 
       rsp = new KernelTokenResponse(remain);
-    } else {
+    } else if (req.what() == kPrefetch) {
+      PrefetchRequest prefetch_req(req);
+      // TODO: correctly configure memory hardware limit
+      const size_t kGpuMemoryLimit = 8 * (1UL << 30);
+      if (total_prefetched_memory + prefetch_req.prefetchSize() < kGpuMemoryLimit - group->getPeerMemoryUsage()) {
+        total_prefetched_memory += prefetch_req.prefetchSize();
+        rsp = new PrefetchResponse(true);
+      } else {
+        rsp = new PrefetchResponse(false);
+      }
+    }
+    
+     else {
       ERROR("Client group %s received an unknown request from client %s", group->getName().c_str(),
             req.from().c_str());
       rsp = new Response();

@@ -36,6 +36,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 #include <climits>
 #include <cmath>
@@ -366,7 +367,19 @@ double get_token_from_scheduler(double next_burst) {
   PrefetchTokenRequest prefetch_request(client_random_id, overuse, next_burst);
   requester->submit(prefetch_request, nullptr);
   DEBUG("received prefetch token");
-  // TODO: start prefetch
+  
+  // TODO: move prefetching to another thread
+  for (auto p : allocation_map) {
+    CUdeviceptr devptr = p.first;
+    size_t memory_size = p.second;
+    PrefetchRequest prefetch_request(client_random_id, memory_size);
+    PrefetchResponse prefetch_response;
+    requester->submit(prefetch_request, &prefetch_response);
+    if (!prefetch_response.permitted()) break;
+    DEBUG("prefetching 0x%" PRIx64 " (%" PRId64 " B)", devptr, memory_size);
+
+    // TODO: perform prefetching
+  }
 
   KernelTokenRequest kernel_request(client_random_id, overuse, next_burst);
   KernelTokenResponse kernel_response;

@@ -47,10 +47,12 @@ class ClientGroup {
   double maxFrac();
   double getQuota();
   void updateQuota();
-  void waitKernelToken();
+  void waitKernelToken(size_t memory_usage);
   void waitPrefetchToken();
-  void giveKernelToken();
-  void givePrefetchToken();
+  void giveKernelToken(size_t peer_memory_usage = 0);
+  void givePrefetchToken(size_t peer_memory_usage);
+  size_t getExpectedMemoryUsage();
+  size_t getPeerMemoryUsage();
   std::map<unsigned long long, size_t> memory_map;
 
  private:
@@ -67,6 +69,8 @@ class ClientGroup {
   double burst_;                // duration of kernel burst
   sem_t kernel_token_sem_, prefetch_token_sem_;
   bool already_give_prefetch_token_;
+  size_t expected_memory_usage_;
+  size_t peer_memory_usage_;  // max allowed prefetch size = total GPU memory - peer memory usage
 };
 
 struct Candidate {

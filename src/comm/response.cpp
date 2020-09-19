@@ -41,6 +41,19 @@ PrefetchTokenResponse::PrefetchTokenResponse(vector<zmq_msg_t> &zmq_frames) : Re
   assert(what() == kPrefetchToken);
 }
 
+PrefetchResponse::PrefetchResponse() : Response() {}
+
+PrefetchResponse::PrefetchResponse(bool permitted) : Response() {
+  setType(kPrefetch);
+  addFrame(&permitted, sizeof(bool));
+}
+
+PrefetchResponse::PrefetchResponse(vector<zmq_msg_t> &zmq_frames) : Response(zmq_frames) {
+  assert(what() == kPrefetch);
+}
+
+bool PrefetchResponse::permitted() { return *reinterpret_cast<bool *>(frames_[1].first); }
+
 MemInfoResponse::MemInfoResponse() : Response() {}
 
 MemInfoResponse::MemInfoResponse(size_t used, size_t total) : Response() {

@@ -53,6 +53,13 @@ class PrefetchTokenRequest : public Request {
   double nextBurst();
 };
 
+class PrefetchRequest : public Request {
+ public:
+  PrefetchRequest(const char *client_name, size_t bytes);
+  PrefetchRequest(Request &request);
+  size_t prefetchSize();
+};
+
 class MemInfoRequest : public Request {
  public:
   MemInfoRequest(const char *client_name);
