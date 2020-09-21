@@ -37,6 +37,11 @@ class ClientGroup {
  public:
   ClientGroup(std::string name, double baseq, double minq);
   ~ClientGroup();
+  // allows scheduler to know client group status and perform certain operations
+  enum Status { kInactive, kRunning, kWaitingPrefetchToken, kPrefetching };
+  Status getStatus();
+  void setStatus(Status status);
+
   const std::string &getName();
   void updateConstraint(double minf, double maxf, double maxq, size_t mem_limit);
   void updateReturnTime(double overuse);
@@ -68,9 +73,9 @@ class ClientGroup {
   double latest_actual_usage_;  // client may return eariler (before quota expire)
   double burst_;                // duration of kernel burst
   sem_t kernel_token_sem_, prefetch_token_sem_;
-  bool already_give_prefetch_token_;
   size_t expected_memory_usage_;
   size_t peer_memory_usage_;  // max allowed prefetch size = total GPU memory - peer memory usage
+  Status status_;
 };
 
 struct Candidate {
