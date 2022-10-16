@@ -17,11 +17,11 @@
 #ifndef SCHEDULER_H
 #define SCHEDULER_H
 
-#include <semaphore.h>
-
 #include <list>
 #include <map>
 #include <string>
+
+#include "comm.h"
 
 struct History {
   std::string name;
@@ -33,52 +33,48 @@ struct History {
 const double EXTRA_QUOTA = 10.0;
 const double SCHD_OVERHEAD = 2.0;
 
-class ClientGroup {
+class ClientInfo {
  public:
-  ClientGroup(std::string name, double baseq, double minq);
-  ~ClientGroup();
-  const std::string &getName();
-  void updateConstraint(double minf, double maxf, double maxq, size_t mem_limit);
-  void updateReturnTime(double overuse);
-  void setBurst(double burst);
-  void record(double quota);
-  size_t memLimit();
-  double minFrac();
-  double maxFrac();
-  double getQuota();
-  void updateQuota();
-  void waitToken();
-  void giveToken();
+  ClientInfo(double baseq, double minq, double maxq, double minf, double maxf);
+  ~ClientInfo();
+  void set_burst(double burst);
+  void update_return_time(double overuse);
+  void Record(double quota);
+  double get_min_fraction();
+  double get_max_fraction();
+  double get_quota();
   std::map<unsigned long long, size_t> memory_map;
+  std::string name;
+  size_t gpu_mem_limit;
 
  private:
-  const std::string kName;
-  const double kBaseQuota;  // from command line argument
-  const double kMinQuota;   // from command line argument
-  double mem_limit_;
-  double min_frac_;   // min percentage of GPU compute resource usage
-  double max_frac_;   // max percentage of GPU compute resource usage
-  double max_quota_;  // calculated from time window and max fraction
+  const double MIN_FRAC;    // min percentage of GPU compute resource usage
+  const double MAX_FRAC;    // max percentage of GPU compute resource usage
+  const double BASE_QUOTA;  // from command line argument
+  const double MIN_QUOTA;   // from command line argument
+  const double MAX_QUOTA;   // calculated from time window and max fraction
   double quota_;
   double latest_overuse_;
   double latest_actual_usage_;  // client may return eariler (before quota expire)
   double burst_;                // duration of kernel burst
-  sem_t token_sem_;
 };
 
-struct Candidate {
-  ClientGroup *group_ptr;
+// the connection to specific container
+struct candidate_t {
+  int socket;
+  std::string name;  // container name
+  reqid_t req_id;
   double arrived_time;
 };
 
-struct ValidCandidate {
+struct valid_candidate_t {
   double missing;    // requirement - usage
   double remaining;  // limit - usage
   double usage;
   double arrived_time;
-  std::list<Candidate>::iterator iter;
+  std::list<candidate_t>::iterator iter;
 };
 
-bool schd_priority(const ValidCandidate &a, const ValidCandidate &b);
+bool schd_priority(const valid_candidate_t &a, const valid_candidate_t &b);
 
 #endif
