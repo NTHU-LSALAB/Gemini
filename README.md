@@ -1,7 +1,7 @@
 # Gemini
 
 ## Note !!!
-Version v1.1 is for the version 
+Version v1.1 is for the version that support latest cuda version and multi GPU  
 
 ## About
 
