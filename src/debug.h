@@ -23,6 +23,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <sys/types.h>
+#include <unistd.h>
 
 #define DEBUG_MSG_LEN 256
 
