@@ -13,22 +13,20 @@
 # limitations under the License.
 
 # path to CUDA installation
-CUDA_PATH ?= /usr/local/cuda
+CUDA_PATH ?= /usr/local/cuda-10.0
 PWD := $(shell pwd)
 PREFIX ?= $(PWD)/..
-INSTALL = /usr/bin/install
-PKGCONFIG = /usr/bin/pkg-config
 
-SMS ?= 30 35 37 50 52 60 61 70
+SMS ?= 35 37 50 52 60 61 70
 GENCODE_FLAGS += $(foreach sm,$(SMS),-gencode arch=compute_$(sm),code=sm_$(sm))
 
-CXX ?= g++
+CXX ?= g++-8
 NVCC ?= $(CUDA_PATH)/bin/nvcc -ccbin $(CXX)
 
 CUDA_LDFLAGS += -lcuda -L$(CUDA_PATH)/lib64 -L$(CUDA_PATH)/lib64/stubs
 LDFLAGS += -ldl -lrt
 
-CXXFLAGS += -fPIC
+CXXFLAGS += -std=c++11 -fPIC
 
 ifeq ($(DEBUG),1)
 CXXFLAGS += -g -D_DEBUG -Wall
@@ -36,54 +34,44 @@ else
 CXXFLAGS += -O2
 endif
 
-# Communication library
-COMM_FILES = endpoint message request response
-COMM_HEADERS = $(foreach file,$(COMM_FILES),comm/$(file).hpp)
-COMM_OBJS = $(foreach file,$(COMM_FILES),comm/$(file).o)
-
-# Third-party libraries
-EXTLIBS = libzmq glib-2.0 gio-2.0
-CXXFLAGS += $(foreach ext,$(EXTLIBS),$(shell $(PKGCONFIG) --cflags $(ext)))
-LDFLAGS += $(foreach ext,$(EXTLIBS),$(shell $(PKGCONFIG) --libs $(ext)))
-
 # Target rules
-.PHONY: comm
-
-all: libgemhook.so.1 gem-schd
+all: libgemhook.so.1 gem-schd gem-pmgr
 
 debug.o: debug.cpp debug.h
-	$(CXX) $(CXXFLAGS) -o $@ -c $<
+	g++ -fPIC $(CXXFLAGS) -o $@ -c $<
 
-hook.o: hook.cpp debug.h predictor.h util.h $(COMM_HEADERS)
+comm.o: comm.cpp comm.h
+	g++ -fPIC $(CXXFLAGS) -o $@ -c $<
+
+hook.o: hook.cpp debug.h comm.h predictor.h util.h
 	$(NVCC) -m64 --compiler-options "$(CXXFLAGS)" $(GENCODE_FLAGS) -o $@ -c $<
 
 predictor.o: predictor.cpp predictor.h debug.h
-	$(CXX) $(CXXFLAGS) -o $@ -c $<
+	g++ -fPIC $(CXXFLAGS) -o $@ -c $<
 
-libgemhook.so.1: hook.o predictor.o debug.o comm
-	$(NVCC) hook.o predictor.o debug.o $(COMM_OBJS) \
-		-shared -m64 $(GENCODE_FLAGS) $(CUDA_LDFLAGS) $(LDFLAGS) -o $@
-	mkdir -p $(PREFIX)/lib
-	$(INSTALL) -s -m 755 -t $(PREFIX)/lib $@
+libgemhook.so.1: hook.o predictor.o debug.o comm.o
+	$(EXEC) $(NVCC) -shared -m64 $(GENCODE_FLAGS) -o $@ $+ $(CUDA_LDFLAGS) $(LDFLAGS)
+	$(EXEC) mkdir -p $(PREFIX)/lib
+	$(EXEC) cp $@ $(PREFIX)/lib
 
-scheduler.o: scheduler.cpp debug.h util.h scheduler.h $(COMM_HEADERS)
-	$(CXX) $(CXXFLAGS) -o $@ -c $<
+scheduler.o: scheduler.cpp debug.h comm.h util.h scheduler.h
+	$(EXEC) g++ $(CXXFLAGS) -o $@ -c $<
 
 schd-priority.o: schd-priority.cpp scheduler.h
-	$(CXX) $(CXXFLAGS) -o $@ -c $<
+	$(EXEC) g++ $(CXXFLAGS) -o $@ -c $<
 
-parse-config.o: parse-config.cpp parse-config.h
-	$(CXX) $(CXXFLAGS) -o $@ -c $<
+gem-schd: scheduler.o schd-priority.o debug.o comm.o
+	$(EXEC) g++ $(LDFLAGS) -pthread -rdynamic $+ -o $@
+	$(EXEC) mkdir -p $(PREFIX)/bin
+	$(EXEC) cp $@ $(PREFIX)/bin
 
-gem-schd: scheduler.o schd-priority.o debug.o parse-config.o comm
-	$(CXX) scheduler.o schd-priority.o debug.o parse-config.o $(COMM_OBJS) \
-		$(LDFLAGS) -pthread -o $@
-	mkdir -p $(PREFIX)/bin
-	$(INSTALL) -s -m 755 -t $(PREFIX)/bin $@
+pod-manager.o: pod-manager.cpp debug.h comm.h util.h
+	$(EXEC) g++ $(CXXFLAGS) -o $@ -c $<
 
-comm:
-	@$(MAKE) -C comm
+gem-pmgr: pod-manager.o debug.o comm.o
+	$(EXEC) g++ $(LDFLAGS) -pthread -rdynamic $+ -o $@
+	$(EXEC) mkdir -p $(PREFIX)/bin
+	$(EXEC) cp $@ $(PREFIX)/bin
 
 clean:
-	@$(MAKE) -C comm clean
 	rm -f *.o
