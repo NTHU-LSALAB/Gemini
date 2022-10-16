@@ -62,7 +62,6 @@ class Predictor {
   timepoint_t long_period_begin_, long_period_end_;
   RecordKeeper normal_records, long_records;
   double upperbound_;
-  pid_t pid;
 };
 
 #endif

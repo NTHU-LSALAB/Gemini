@@ -24,6 +24,7 @@
  */
 
 #include "predictor.h"
+
 #include "debug.h"
 
 using std::make_pair;
@@ -68,7 +69,6 @@ Predictor::Predictor(const char *name, const double thres)
   long_period_end_ = timepoint_t::min();
   upperbound_ = std::numeric_limits<double>::max();
   name_ = name;
-  pid = getpid();
 }
 
 Predictor::~Predictor() { pthread_mutex_destroy(&mutex_); }
@@ -84,7 +84,7 @@ void Predictor::record_stop() {
 #ifndef NO_PREDICT
   double duration;
   timepoint_t tp;
-
+  char* log_name = "/kubeshare/log/predictor.log";
   pthread_mutex_lock(&mutex_);
   if (ongoing_unmerged()) {
     // record duration
@@ -94,7 +94,7 @@ void Predictor::record_stop() {
     long_period_end_ = tp;
     long_records.add(
         duration_cast<microseconds>(long_period_end_ - long_period_begin_).count() / 1e3, tp);
-    DEBUG("%s: record stop (length: %.3f ms), PID: %d", name_, duration, pid);
+    hDEBUG(log_name, __FILE__, (long)__LINE__, "%s: record stop (length: %.3f ms)", name_, duration);
   }
   period_begin_ = timepoint_t::max();
   pthread_mutex_unlock(&mutex_);
@@ -105,6 +105,7 @@ void Predictor::record_stop() {
 void Predictor::record_start() {
 #ifndef NO_PREDICT
   double intv;
+  char* log_name = "/kubeshare/log/predictor.log";
   pthread_mutex_lock(&mutex_);
   if (!ongoing_unmerged()) {
     period_begin_ = steady_clock::now();
@@ -116,7 +117,7 @@ void Predictor::record_start() {
       long_period_end_ = timepoint_t::min();
     }
 
-    DEBUG("%s: record start, PID: %d", name_, pid);
+    hDEBUG(log_name, __FILE__, (long)__LINE__, "%s: record start", name_);
   }
   pthread_mutex_unlock(&mutex_);
 #endif
@@ -126,11 +127,12 @@ void Predictor::record_start() {
 // A new period begins with another record_start call afterwards.
 void Predictor::interrupt() {
 #ifndef NO_PREDICT
+  char* log_name = "/kubeshare/log/predictor.log";
   pthread_mutex_lock(&mutex_);
   period_begin_ = timepoint_t::max();
   long_period_begin_ = timepoint_t::max();
   long_period_end_ = timepoint_t::min();
-  DEBUG("%s: interrupted, PID: %d", name_, pid);
+  hDEBUG(log_name, __FILE__, (long)__LINE__, "%s: interrupted", name_);
   pthread_mutex_unlock(&mutex_);
 #endif
 }

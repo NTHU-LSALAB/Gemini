@@ -1,7 +1,7 @@
 /**
  * Copyright 2020 Hung-Hsin Chen, LSA Lab, National Tsing Hua University
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (const char* log_name, const char* file, long line, the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
@@ -23,14 +23,16 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <sys/types.h>
-#include <unistd.h>
 
 #define DEBUG_MSG_LEN 256
 
-void DEBUG(const char *format, ...);
-void INFO(const char *format, ...);
-void WARNING(const char *format, ...);
-void ERROR(const char *format, ...);
+void DEBUG(const char* log_name, const char* file, long line, const char *format, ...);
+void INFO(const char* log_name, const char* file, long line, const char *format, ...);
+void WARNING(const char* log_name, const char* file, long line, const char *format, ...);
+void ERROR(const char* log_name, const char* file, long line, const char *format, ...);
+void hDEBUG(const char* log_name, const char* file, long line, const char *format, ...);
+void hINFO(const char* log_name, const char* file, long line, const char *format, ...);
+void hWARNING(const char* log_name, const char* file, long line, const char *format, ...);
+void hERROR(const char* log_name, const char* file, long line, const char *format, ...);
 
 #endif

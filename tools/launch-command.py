@@ -42,7 +42,7 @@ def main():
     client_env['LD_PRELOAD'] = "{}/gemini/lib/libgemhook.so.1".format(Path.home())
 
     proc = sp.Popen(
-        args.command, env=client_env, start_new_session=True, universal_newlines=True, bufsize=1, shell=True, stderr=sp.STDOUT
+        args.command, env=client_env, start_new_session=True, universal_newlines=True, bufsize=1
     )
 
     print("[launcher] run: {}".format(args.command))

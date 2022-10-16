@@ -20,7 +20,7 @@
  */
 
 #include "comm.h"
-#include <cerrno>
+
 #include "debug.h"
 
 reqid_t prepare_request(char *buf, comm_request_t type, ...) {
@@ -123,11 +123,12 @@ char *parse_response(char *buf, reqid_t *id) {
 // -1, errno will be returned.
 int multiple_attempt(std::function<int()> func, int max_attempt, int interval) {
   int rc;
+  char* log_name = "/kubeshare/log/comm.log";
   for (int attempt = 1; attempt <= max_attempt; attempt++) {
     rc = func();
     if (rc == 0) break;
     if (rc == -1) rc = errno;
-    ERROR("attempt %d: %s", attempt, strerror(rc));
+    hERROR(log_name, __FILE__, (long)__LINE__, "attempt %d: %s", attempt, strerror(rc));
     if (interval > 0) sleep(interval);
   }
   return rc;

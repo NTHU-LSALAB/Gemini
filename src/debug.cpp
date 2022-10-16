@@ -15,7 +15,8 @@
  */
 
 #include "debug.h"
-
+#include<iostream>
+#include<fstream>
 void sprint_date(char *buf, const size_t len) {
   time_t timer;
   struct tm *tm_info;
@@ -34,22 +35,41 @@ void sprint_date(char *buf, const size_t len) {
 }
 
 #define GENERATE_PRINT(func, level)                              \
-  void func(const char *format, ...) {                           \
+  void func(const char* log_name, const char* file, long line, const char *format, ...) {                           \
     char buf[DEBUG_MSG_LEN], date_buf[100];                      \
     va_list args;                                                \
                                                                  \
     sprint_date(date_buf, 100);                                  \
     va_start(args, format);                                      \
     vsnprintf(buf, DEBUG_MSG_LEN, format, args);                 \
+   fprintf(stderr, "%s " level ":%s:%ld %s\n", date_buf, file, line, buf); \
+  }
+
+#define GENERATE_f(func, level)                              \
+  void func(const char* log_name, const char* file, long line, const char *format, ...) {                           \
+    char buf[DEBUG_MSG_LEN], date_buf[100];                      \
+    va_list args;                                                \
                                                                  \
-    fprintf(stderr, "%s Gemini " level "/ %s\n", date_buf, buf); \
+    sprint_date(date_buf, 100);                                  \
+    va_start(args, format);                                      \
+    vsnprintf(buf, DEBUG_MSG_LEN, format, args);                 \
+    std::ofstream logger;                                        \
+    logger.open ("/kubeshare/log/hook.log", std::ios::out | std::ios::app);\
+    logger<<date_buf<<" "<<level<<":"<<file<<":"<<line<<" "<<buf<<std::endl; \
+    logger.close(); \
   }
 
 #ifdef _DEBUG
-GENERATE_PRINT(DEBUG, "D")
+GENERATE_PRINT(DEBUG, "DEBU")
+GENERATE_f(hDEBUG, "DEBU")
 #else
-void DEBUG(const char *format, ...) {}
+void DEBUG(const char* log_name, const char* file, long line, const char *format, ...) {}
+void hDEBUG(const char* file, long line, const char *format, ...) {}
 #endif
-GENERATE_PRINT(INFO, "I")
-GENERATE_PRINT(WARNING, "W")
-GENERATE_PRINT(ERROR, "E")
+GENERATE_PRINT(INFO, "INFO")
+GENERATE_PRINT(WARNING, "WARN")
+GENERATE_PRINT(ERROR, "ERRO")
+GENERATE_f(hINFO, "INFO")
+GENERATE_f(hWARNING, "WARN")
+GENERATE_f(hERROR, "ERRO")
+//fprintf(stderr, "%s " level "%s:%ld %s\n", date_buf, file, line, buf); 
