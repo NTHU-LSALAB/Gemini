@@ -21,6 +21,8 @@
  * connection and requests from pod manager or hook library directly.
  */
 
+#include <iostream>
+#include <fstream>
 #include "scheduler.h"
 
 #include <arpa/inet.h>
@@ -44,8 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <iostream>
+
 #include <limits>
 #include <list>
 #include <map>
@@ -90,7 +91,7 @@ double QUOTA = 250.0;
 double MIN_QUOTA = 100.0;
 double WINDOW_SIZE = 10000.0;
 int verbosity = 0;
-
+char* log_name = "/kubeshare/log/gemini-scheduler.log";
 #define EVENT_SIZE sizeof(struct inotify_event)
 #define BUF_LEN (1024 * (EVENT_SIZE + 16))
 auto PROGRESS_START = steady_clock::now();
@@ -162,12 +163,12 @@ double ClientInfo::get_quota() {
   if (burst_ < 1e-9) {
     // special case when no burst data available, just fallback to static quota
     quota_ = BASE_QUOTA;
-    DEBUG("%s: fallback to static quota, assign quota: %.3fms", name.c_str(), quota_);
+    DEBUG(log_name, __FILE__, (long)__LINE__, "%s: fallback to static quota, assign quota: %.3fms", name.c_str(), quota_);
   } else {
     quota_ = burst_ * UPDATE_RATE + quota_ * (1 - UPDATE_RATE);
     quota_ = std::max(quota_, MIN_QUOTA);  // lowerbound
     quota_ = std::min(quota_, MAX_QUOTA);  // upperbound
-    DEBUG("%s: burst: %.3fms, assign quota: %.3fms", name.c_str(), burst_, quota_);
+    DEBUG(log_name, __FILE__, (long)__LINE__, "%s: burst: %.3fms, assign quota: %.3fms", name.c_str(), burst_, quota_);
   }
   return quota_;
 }
@@ -180,7 +181,7 @@ pthread_mutex_t candidate_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t candidate_cond;  // initialized with CLOCK_MONOTONIC in main()
 
 void read_resource_config() {
-  std::fstream fin;
+  std::ifstream fin;
   ClientInfo *client_inf;
   char client_name[HOST_NAME_MAX], full_path[PATH_MAX];
   size_t gpu_memory_size;
@@ -195,11 +196,11 @@ void read_resource_config() {
   // Read GPU limit usage
   fin.open(full_path, std::ios::in);
   if (!fin.is_open()) {
-    ERROR("failed to open file %s: %s", full_path, strerror(errno));
+    ERROR(log_name, __FILE__, (long)__LINE__, "failed to open file %s: %s", full_path, strerror(errno));
     exit(1);
   }
   fin >> container_num;
-  INFO("There are %d clients in the system...", container_num);
+  INFO(log_name, __FILE__, (long)__LINE__, "There are %d clients in the system...", container_num);
   for (int i = 0; i < container_num; i++) {
     fin >> client_name >> gpu_min_fraction >> gpu_max_fraction >> gpu_memory_size;
     client_inf = new ClientInfo(QUOTA, MIN_QUOTA, gpu_max_fraction * WINDOW_SIZE, gpu_min_fraction,
@@ -209,44 +210,45 @@ void read_resource_config() {
     if (client_info_map.find(client_name) != client_info_map.end())
       delete client_info_map[client_name];
     client_info_map[client_name] = client_inf;
-    INFO("%s request: %.2f, limit: %.2f, memory limit: %lu bytes", client_name, gpu_min_fraction,
+    INFO(log_name, __FILE__, (long)__LINE__, "%s request: %.2f, limit: %.2f, memory limit: %lu bytes", client_name, gpu_min_fraction,
          gpu_max_fraction, gpu_memory_size);
   }
   fin.close();
 }
 
 void monitor_file(const char *path, const char *filename) {
-  INFO("Monitor thread created.");
+  INFO(log_name, __FILE__, (long)__LINE__, "Monitor thread created.");
   int fd, wd;
 
   // Initialize Inotify
   fd = inotify_init();
-  if (fd < 0) ERROR("Failed to initialize inotify");
+  if (fd < 0) ERROR(log_name, __FILE__, (long)__LINE__, "Failed to initialize inotify");
 
   // add watch to starting directory
   wd = inotify_add_watch(fd, path, IN_CLOSE_WRITE);
 
   if (wd == -1)
-    ERROR("Failed to add watch to '%s'.", path);
+    ERROR(log_name, __FILE__, (long)__LINE__, "Failed to add watch to '%s'.", path);
   else
-    INFO("Watching '%s'.", path);
+    INFO(log_name, __FILE__, (long)__LINE__, "Watching '%s'.", path);
 
   // start watching
   while (1) {
     int i = 0;
     char buffer[BUF_LEN];
+    bzero(buffer, BUF_LEN);
     int length = read(fd, buffer, BUF_LEN);
-    if (length < 0) ERROR("Read error");
+    if (length < 0) ERROR(log_name, __FILE__, (long)__LINE__, "Read error");
 
     while (i < length) {
       struct inotify_event *event = (struct inotify_event *)&buffer[i];
 
       if (event->len) {
         if (event->mask & IN_CLOSE_WRITE) {
-          INFO("File %s modified with watch descriptor %d.", (const char *)event->name, event->wd);
+          INFO(log_name, __FILE__, (long)__LINE__, "File %s modified with watch descriptor %d.", (const char *)event->name, event->wd);
           // if event is triggered by target file
           if (strcmp((const char *)event->name, filename) == 0) {
-            INFO("Update containers' settings...");
+            INFO(log_name, __FILE__, (long)__LINE__, "Update containers' settings...");
             read_resource_config();
           }
         }
@@ -381,7 +383,7 @@ candidate_t select_candidate() {
     if (vaild_candidates.size() == 0) {
       // all candidates reach usage limit
       auto ts = get_timespec_after(history_list.begin()->end - window_start);
-      DEBUG("sleep until %ld.%03ld", ts.tv_sec, ts.tv_nsec / 1000000);
+      DEBUG(log_name, __FILE__, (long)__LINE__, "sleep until %ld.%03ld", ts.tv_sec, ts.tv_nsec / 1000000);
       // also wakes up if new requests come in
       pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
       continue;  // go to begin of loop
@@ -407,12 +409,12 @@ void handle_message(int client_sock, char *message) {
   attached = parse_request(message, &client_name, &hostname_len, &req_id, &req);
 
   if (client_info_map.find(string(client_name)) == client_info_map.end()) {
-    WARNING("Unknown client \"%s\". Ignore this request.", client_name);
+    WARNING(log_name, __FILE__, (long)__LINE__, "Unknown client \"%s\". Ignore this request.", client_name);
     return;
   }
   client_inf = client_info_map[string(client_name)];
   bzero(sbuf, RSP_MSG_LEN);
-
+  int rc ,  MAX_RETRY = 5;
   if (req == REQ_QUOTA) {
     double overuse, burst, window;
     overuse = get_msg_data<double>(attached, offset);
@@ -427,16 +429,32 @@ void handle_message(int client_sock, char *message) {
     // select_candidate() will give quota later
 
   } else if (req == REQ_MEM_LIMIT) {
+
     prepare_response(sbuf, REQ_MEM_LIMIT, req_id, (size_t)0, client_inf->gpu_mem_limit);
-    send(client_sock, sbuf, RSP_MSG_LEN, 0);
+    
+     rc = multiple_attempt(
+        [&]() -> int {
+          if(send(client_sock, sbuf, RSP_MSG_LEN, 0) == -1) return -1;
+          DEBUG(log_name, __FILE__, (long)__LINE__, "%s handle_message: REQ_MEM_LIMIT %d ",client_name, req_id);
+        },
+        MAX_RETRY, 3);
+    
   } else if (req == REQ_MEM_UPDATE) {
     // ***for communication interface compatibility only***
     // memory usage is only tracked on hook library side
-    WARNING("scheduler always returns true for memory usage update!");
+    DEBUG(log_name, __FILE__, (long)__LINE__, "scheduler always returns true for memory usage update!");
+
     prepare_response(sbuf, REQ_MEM_UPDATE, req_id, 1);
-    send(client_sock, sbuf, RSP_MSG_LEN, 0);
+    
+    rc = multiple_attempt(
+        [&]() -> int {
+          if(send(client_sock, sbuf, RSP_MSG_LEN, 0) == -1) return -1;
+          DEBUG(log_name, __FILE__, (long)__LINE__, "%s handle_message: REQ_MEM_UPDATE %d ",client_name, req_id);
+        },
+        MAX_RETRY, 3);
+    
   } else {
-    WARNING("\"%s\" send an unknown request.", client_name);
+    WARNING(log_name, __FILE__, (long)__LINE__, "\"%s\" send an unknown request.", client_name);
   }
 }
 
@@ -453,7 +471,7 @@ void *schedule_daemon_func(void *) {
     if (candidates.size() != 0) {
       // remove an entry from candidates
       candidate_t selected = select_candidate();
-      DEBUG("select %s, waiting time: %.3f ms", selected.name.c_str(),
+      DEBUG(log_name, __FILE__, (long)__LINE__, "select %s, waiting time: %.3f ms", selected.name.c_str(),
             ms_since_start() - selected.arrived_time);
 
       quota = client_info_map[selected.name]->get_quota();
@@ -468,7 +486,17 @@ void *schedule_daemon_func(void *) {
       char sbuf[RSP_MSG_LEN];
       bzero(sbuf, RSP_MSG_LEN);
       prepare_response(sbuf, REQ_QUOTA, selected.req_id, quota);
-      send(selected.socket, sbuf, RSP_MSG_LEN, 0);
+
+      int rc, MAX_RETRY=5;
+      rc = multiple_attempt(
+        [&]() -> int {
+          if(send(selected.socket, sbuf, RSP_MSG_LEN, 0) == -1){
+              DEBUG(log_name, __FILE__, (long)__LINE__, "%s schedule_daemon_func - send error %s", selected.name.c_str(), strerror(errno));
+             return -1;
+          }
+        },
+        MAX_RETRY, 3);
+    
 
       struct timespec ts = get_timespec_after(quota);
 
@@ -478,7 +506,7 @@ void *schedule_daemon_func(void *) {
       while (should_wait) {
         int rc = pthread_cond_timedwait(&candidate_cond, &candidate_mutex, &ts);
         if (rc == ETIMEDOUT) {
-          DEBUG("%s didn't return on time", selected.name.c_str());
+          DEBUG(log_name, __FILE__, (long)__LINE__, "%s didn't return on time", selected.name.c_str());
           should_wait = false;
         } else {
           // check if the selected one comes back
@@ -493,7 +521,7 @@ void *schedule_daemon_func(void *) {
       pthread_mutex_unlock(&candidate_mutex);
     } else {
       // wait for incoming connections
-      DEBUG("no candidates");
+      DEBUG(log_name, __FILE__, (long)__LINE__, "no candidates");
       pthread_cond_wait(&candidate_cond, &candidate_mutex);
       pthread_mutex_unlock(&candidate_mutex);
     }
@@ -505,17 +533,23 @@ void *pod_client_func(void *args) {
   int pod_sockfd = *((int *)args);
   char *rbuf = new char[REQ_MSG_LEN];
   ssize_t recv_rc;
+  bzero(rbuf, REQ_MSG_LEN);
+
   while ((recv_rc = recv(pod_sockfd, rbuf, REQ_MSG_LEN, 0)) > 0) {
+    DEBUG(log_name, __FILE__, (long)__LINE__, "pod_client_func recv -> handle message");
     handle_message(pod_sockfd, rbuf);
   }
-  DEBUG("Connection closed by Pod manager. recv() returns %ld.", recv_rc);
+  DEBUG(log_name, __FILE__, (long)__LINE__, "Connection closed by Pod manager. recv() returns %ld.", recv_rc);
   close(pod_sockfd);
   delete (int *)args;
   delete[] rbuf;
   pthread_exit(NULL);
 }
 
+
+
 int main(int argc, char *argv[]) {
+  
   uint16_t schd_port = 50051;
   // parse command line options
   const char *optstring = "P:q:m:w:f:p:v:h";
@@ -597,7 +631,7 @@ int main(int argc, char *argv[]) {
 
   sockfd = socket(AF_INET, SOCK_STREAM, 0);
   if (sockfd == -1) {
-    ERROR("Fail to create a socket!");
+    ERROR(log_name, __FILE__, (long)__LINE__, "Fail to create a socket!");
     exit(-1);
   }
 
@@ -608,7 +642,7 @@ int main(int argc, char *argv[]) {
   serverInfo.sin_addr.s_addr = INADDR_ANY;
   serverInfo.sin_port = htons(schd_port);
   if (bind(sockfd, (struct sockaddr *)&serverInfo, sizeof(serverInfo)) < 0) {
-    ERROR("cannot bind port");
+    ERROR(log_name, __FILE__, (long)__LINE__, "cannot bind port");
     exit(-1);
   }
   listen(sockfd, SOMAXCONN);
@@ -622,16 +656,17 @@ int main(int argc, char *argv[]) {
   pthread_cond_init(&candidate_cond, &attr_monotonic_clock);
 
   rc = pthread_create(&tid, NULL, schedule_daemon_func, NULL);
+  
   if (rc != 0) {
-    ERROR("Return code from pthread_create(): %d", rc);
+    ERROR(log_name, __FILE__, (long)__LINE__, "Return code from pthread_create(): %d", rc);
     exit(rc);
   }
   pthread_detach(tid);
-  INFO("Waiting for incoming connection");
+  INFO(log_name, __FILE__, (long)__LINE__, "Waiting for incoming connection");
 
   while (
       (forClientSockfd = accept(sockfd, (struct sockaddr *)&clientInfo, (socklen_t *)&addrlen))) {
-    INFO("Received an incoming connection.");
+    INFO(log_name, __FILE__, (long)__LINE__, "Received an incoming connection.");
     pthread_t tid;
     int *pod_sockfd = new int;
     *pod_sockfd = forClientSockfd;
@@ -640,7 +675,7 @@ int main(int argc, char *argv[]) {
     pthread_detach(tid);
   }
   if (forClientSockfd < 0) {
-    ERROR("Accept failed");
+    ERROR(log_name, __FILE__, (long)__LINE__, "Accept failed");
     return 1;
   }
   return 0;
@@ -650,7 +685,7 @@ void sig_handler(int sig) {
   void *arr[10];
   size_t s;
   s = backtrace(arr, 10);
-  ERROR("Received signal %d", sig);
+  ERROR(log_name, __FILE__, (long)__LINE__, "Received signal %d", sig);
   backtrace_symbols_fd(arr, s, STDERR_FILENO);
   exit(sig);
 }
@@ -673,7 +708,7 @@ void dump_history(int sig) {
   fputs("]\n", f);
   fclose(f);
 
-  INFO("history dumped to %s", filename);
+  INFO(log_name, __FILE__, (long)__LINE__, "history dumped to %s", filename);
   exit(0);
 }
 #endif

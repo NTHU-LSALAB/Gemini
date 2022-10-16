@@ -1,8 +1,5 @@
 # Gemini
 
-## Note !!!
-Version v1.1 is for the version that support latest cuda version and multi GPU  
-
 ## About
 
 Gemini is an efficient GPU resource sharing system with fine-grained control for Linux platforms.
@@ -61,4 +58,4 @@ For more details, refer to those scripts and source code.
 [jim90247](https://github.com/jim90247)
 [eee4017](https://github.com/eee4017)
 [ncy9371](https://github.com/ncy9371)
-[kerwenwwer](https://github.com/kerwenwwer)
+
