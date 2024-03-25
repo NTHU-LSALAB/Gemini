@@ -1,13 +1,16 @@
 # Gemini
 
-## Note !!!
-Version v1.1 is for the version that support latest cuda version and multi GPU  
-
 ## About
 
 Gemini is an efficient GPU resource sharing system with fine-grained control for Linux platforms.
 
 It shares a NVIDIA GPU among multiple clients with specified resource constraint, and works seamlessly with any CUDA-based GPU programs. Besides, it is also work-conserving and with low overhead, so nearly no compute resource waste will happen.
+
+Our implementation is based on ["Gemini: Enabling Multi-Tenant GPU Sharing Based on Kernel Burst Estimation"](https://ieeexplore.ieee.org/abstract/document/9566822).
+
+However, we extend the Gemini in a number of ways:
+* Compatible with [Kubeshare](https://github.com/NTHU-LSALAB/KubeShare)
+* Multi GPU support. For instance, we offer the option to order multiple half-sized GPUs.
 
 ## System Structure
 
